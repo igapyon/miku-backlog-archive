@@ -11,7 +11,7 @@ const operationNames = [
   'get_project', 'get_project_users', 'get_project_statuses', 'get_categories',
   'get_custom_fields', 'get_issue_types', 'get_version_milestone_list',
   'get_issues', 'get_issue', 'get_issue_comments', 'get_issue_participants',
-  'get_related_issues', 'get_wiki_pages', 'get_wiki', 'get_shared_files',
+  'get_related_issues', 'get_wiki_pages', 'get_wiki', 'get_wiki_attachments', 'get_shared_files',
   'download_issue_attachment', 'download_wiki_attachment', 'download_shared_file',
 ];
 const immediateWait = async () => {};
@@ -41,7 +41,7 @@ function fixtureRuntime(responses, calls, downloads = async (operation) => {
   throw new Error(`Unexpected download ${operation}`);
 }) {
   return {
-    product: { name: 'miku-backlog-api', version: '0.7.10' },
+    product: { name: 'miku-backlog-api', version: '0.8.0' },
     listOperations() {
       return operationNames.map((name) => ({ name, mutationClass: 'read', requiredPermission: 'READ' }));
     },
@@ -147,7 +147,7 @@ test('collects normalized issue data and skips completed tasks on resume', async
     sharedFileCount: 0,
     assetCount: 0,
     collectedAssetCount: 0,
-    runtime: { name: 'miku-backlog-api', version: '0.7.10' },
+    runtime: { name: 'miku-backlog-api', version: '0.8.0' },
   });
 
   const savedIssue = JSON.parse(await readFile(join(output, 'data', 'issues', '101.json'), 'utf8'));
@@ -796,10 +796,10 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
       }],
     };
     if (operation === 'get_shared_files' && input.path === './') return [
-      { id: 501, projectId: 8, type: 'dir', dir: '/', name: 'nested' },
+      { id: 501, projectId: 8, type: 'directory', dir: '/', name: 'nested' },
       { id: 502, projectId: 8, type: 'file', dir: '/', name: 'shared?.txt', size: 6 },
     ];
-    if (operation === 'get_shared_files' && input.path === '/nested/') return [
+    if (operation === 'get_shared_files' && input.path === 'nested/') return [
       { id: 503, projectId: 8, type: 'file', dir: '/nested/', name: 'inner.txt', size: 5 },
     ];
     throw new Error(`Unexpected operation ${operation} with ${JSON.stringify(input)}`);
@@ -833,11 +833,11 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
     sharedFileCount: 2,
     assetCount: 4,
     collectedAssetCount: 4,
-    runtime: { name: 'miku-backlog-api', version: '0.7.10' },
+    runtime: { name: 'miku-backlog-api', version: '0.8.0' },
   });
   assert.deepEqual(
     calls.filter((call) => call.operation === 'get_shared_files').map((call) => call.input.path),
-    ['./', '/nested/'],
+    ['./', 'nested/'],
   );
 
   const savedWiki = JSON.parse(await readFile(join(output, 'data', 'wikis', '301.json'), 'utf8'));

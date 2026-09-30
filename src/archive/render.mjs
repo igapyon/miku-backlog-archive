@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { writeFileAtomically } from './atomic-write.mjs';
 import { ArchiveFormatError } from './format.mjs';
 import { verifyArchive } from './session.mjs';
+import { formatJstTimestamp } from './time.mjs';
 
 const PROJECT_SCHEMA = 'miku-backlog-archive/project/v1';
 const ISSUE_INDEX_SCHEMA = 'miku-backlog-archive/issue-index/v1';
@@ -111,7 +112,9 @@ function localArchiveHref(value, links) {
   }
   let url;
   try {
-    url = new URL(value);
+    url = value.startsWith('/downloadSharedFile/')
+      ? new URL(value, `https://${links.sourceDomain}`)
+      : new URL(value);
   } catch {
     return null;
   }
@@ -120,6 +123,28 @@ function localArchiveHref(value, links) {
     || url.hostname !== links.sourceDomain
     || url.port !== ''
   ) {
+    return null;
+  }
+
+  const sharedFileMatch = /^\/downloadSharedFile\/([^/]+)\/(\d+)\/([^/]+)$/u.exec(url.pathname);
+  if (sharedFileMatch && url.search === '' && url.hash === '') {
+    let sharedFileProjectKey;
+    try {
+      sharedFileProjectKey = decodeURIComponent(sharedFileMatch[1]);
+    } catch {
+      return null;
+    }
+    const sharedFileId = Number(sharedFileMatch[2]);
+    if (
+      sharedFileProjectKey === links.projectKey
+      && Number.isSafeInteger(sharedFileId)
+      && sharedFileId > 0
+    ) {
+      return assetHref(
+        links.sharedFileAssetsById?.get(sharedFileId),
+        links.assetDepth,
+      );
+    }
     return null;
   }
 
@@ -173,11 +198,11 @@ function splitTrailingUrlPunctuation(value) {
 
 function renderExternalLink(value, links, allowLocalArchiveLink = true, label = null) {
   const href = safeExternalHref(value);
-  if (!href) {
+  const localHref = allowLocalArchiveLink ? localArchiveHref(href ?? value, links) : null;
+  const content = escapeHtml(label ?? href ?? value);
+  if (!href && !localHref) {
     return null;
   }
-  const localHref = allowLocalArchiveLink ? localArchiveHref(href, links) : null;
-  const content = escapeHtml(label ?? href);
   return localHref
     ? `<a href="${escapeHtml(localHref)}">${content}</a>`
     : `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${content}</a>`;
@@ -235,13 +260,13 @@ function renderText(value, links, attachmentLinks) {
   if (typeof value !== 'string' || value === '') {
     return '<span class="muted">—</span>';
   }
-  const pattern = /!\[[^\]\r\n]*\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+)\)|(?<!!)\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+)\)|(https?:\/\/[^\s<>"']+|mailto:[^\s<>"']+)/gu;
+  const pattern = /!\[[^\]\r\n]*\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)|(?<!!)\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)|(https?:\/\/[^\s<>"']+|mailto:[^\s<>"']+|\/downloadSharedFile\/[^\s<>"']+)/gu;
   let result = '';
   let position = 0;
   for (const match of value.matchAll(pattern)) {
     result += renderInlineText(value.slice(position, match.index), links, attachmentLinks);
     if (match[1] !== undefined) {
-      const externalImage = renderExternalLink(match[1], links, false);
+      const externalImage = renderExternalLink(match[1], links);
       result += externalImage ?? escapeHtml(match[0]);
     } else if (match[3] !== undefined) {
       const markdownLink = renderExternalLink(match[3], links, true, match[2]);
@@ -524,8 +549,8 @@ function issuePage(
       <dt>期限日</dt><dd>${escapeHtml(display(issue.dueDate))}</dd>
       <dt>見積時間</dt><dd>${escapeHtml(display(issue.estimatedHours))}</dd>
       <dt>実績時間</dt><dd>${escapeHtml(display(issue.actualHours))}</dd>
-      <dt>作成</dt><dd>${escapeHtml(display(issue.created))} ${escapeHtml(personName(issue.createdUser))}</dd>
-      <dt>更新</dt><dd>${escapeHtml(display(issue.updated))} ${escapeHtml(personName(issue.updatedUser))}</dd>
+      <dt>作成</dt><dd>${escapeHtml(formatJstTimestamp(issue.created))} ${escapeHtml(personName(issue.createdUser))}</dd>
+      <dt>更新</dt><dd>${escapeHtml(formatJstTimestamp(issue.updated))} ${escapeHtml(personName(issue.updatedUser))}</dd>
     </dl>
     <h2>説明</h2>
     <div class="body">${renderBody(issue.description, bodyLinks, attachmentLinks)}</div>
@@ -547,7 +572,7 @@ function issuePage(
     <h2>コメント</h2>
     ${comments.length === 0 ? '<p class="muted">コメントはありません。</p>' : comments.map((comment) => `
       <section>
-        <h3 id="comment-${requirePositiveId(comment.id, 'comment')}"><a href="#comment-${comment.id}">#${comment.id}</a> ${escapeHtml(personName(comment.createdUser))} <span class="muted">${escapeHtml(display(comment.created))}${comment.updated && comment.updated !== comment.created ? ` / 更新 ${escapeHtml(comment.updated)}` : ''}</span></h3>
+        <h3 id="comment-${requirePositiveId(comment.id, 'comment')}"><a href="#comment-${comment.id}">#${comment.id}</a> ${escapeHtml(personName(comment.createdUser))} <span class="muted">${escapeHtml(formatJstTimestamp(comment.created))}${comment.updated && comment.updated !== comment.created ? ` / 更新 ${escapeHtml(formatJstTimestamp(comment.updated))}` : ''}</span></h3>
         <div class="body">${renderBody(comment.content, bodyLinks, attachmentLinks)}</div>
         ${comment.changeLog === null || comment.changeLog === undefined ? '' : `<details><summary>変更記録</summary>${renderJson(comment.changeLog)}</details>`}
       </section>`).join('')}
@@ -562,8 +587,8 @@ function wikiPage(wikiData, wikiAssets, sharedAssetsByFileId, textLinks) {
   return page(display(wiki.name, `Wiki ${wikiId}`), 1, `
     <dl class="meta">
       <dt>タグ</dt><dd>${escapeHtml(displayNames(wiki.tags))}</dd>
-      <dt>作成</dt><dd>${escapeHtml(display(wiki.created))} ${escapeHtml(personName(wiki.createdUser))}</dd>
-      <dt>更新</dt><dd>${escapeHtml(display(wiki.updated))} ${escapeHtml(personName(wiki.updatedUser))}</dd>
+      <dt>作成</dt><dd>${escapeHtml(formatJstTimestamp(wiki.created))} ${escapeHtml(personName(wiki.createdUser))}</dd>
+      <dt>更新</dt><dd>${escapeHtml(formatJstTimestamp(wiki.updated))} ${escapeHtml(personName(wiki.updatedUser))}</dd>
     </dl>
     <h2>本文</h2>
     <div class="body">${renderBody(wiki.content, textLinks, attachmentLinks)}</div>
@@ -661,6 +686,10 @@ export async function renderArchive(input) {
   const wikiAssets = requireArray(assetIndex.wikiAttachments, 'wiki assets');
   const sharedAssets = requireArray(assetIndex.sharedFiles, 'shared assets');
   const sharedAssetsByFileId = new Map(sharedAssets.map((asset) => [asset.sharedFileId, asset]));
+  const sharedFileAssetsById = new Map(sharedFiles
+    .filter((file) => Number.isSafeInteger(file.id) && file.id > 0)
+    .map((file) => [file.id, sharedAssetsByFileId.get(file.id)])
+    .filter(([, asset]) => asset));
 
   const issues = [];
   for (const summary of issueSummaries) {
@@ -686,20 +715,24 @@ export async function renderArchive(input) {
   const commentIdsByIssueKey = new Map(
     issues.map(({ issue, comments }) => [issue.issueKey, new Set(comments.map((comment) => comment.id))]),
   );
-  const makeTextLinks = (issueHref, wikiHref) => ({
+  const makeTextLinks = (issueHref, wikiHref, assetDepth) => ({
     sourceDomain: manifest.source.domain,
     projectKey: projectData.project.projectKey,
     issueKeys: new Map(issues.map(({ issue }) => [issue.issueKey, issueHref(issue)])),
     wikiIds: new Map(wikis.map(({ wiki }) => [wiki.id, wikiHref(wiki)])),
     commentIdsByIssueKey,
+    sharedFileAssetsById,
+    assetDepth,
   });
   const textLinksFromHome = makeTextLinks(
     (issue) => `issues/${issue.id}.html`,
     (wiki) => `wikis/${wiki.id}.html`,
+    0,
   );
   const textLinksFromIssue = makeTextLinks(
     (issue) => `${issue.id}.html`,
     (wiki) => `../wikis/${wiki.id}.html`,
+    1,
   );
   const issueLinksById = new Map(
     issues.map(({ issue }) => [issue.id, issue.issueKey]),
@@ -716,14 +749,15 @@ export async function renderArchive(input) {
   const textLinksFromWiki = makeTextLinks(
     (issue) => `../issues/${issue.id}.html`,
     (wiki) => `${wiki.id}.html`,
+    1,
   );
   await writeFileAtomically(join(paths.site, 'index.html'), page(projectData.project.name, 0, `
     <p>${renderText(projectData.project.description, textLinksFromHome)}</p>
     <dl class="meta">
       <dt>プロジェクト</dt><dd>${escapeHtml(display(projectData.project.projectKey))}</dd>
       <dt>取得元</dt><dd>${escapeHtml(display(manifest.source?.domain))}</dd>
-      <dt>取得開始</dt><dd>${escapeHtml(display(manifest.collection?.startedAt))}</dd>
-      <dt>取得完了</dt><dd>${escapeHtml(display(manifest.collection?.completedAt))}</dd>
+      <dt>取得開始</dt><dd>${escapeHtml(formatJstTimestamp(manifest.collection?.startedAt))}</dd>
+      <dt>取得完了</dt><dd>${escapeHtml(formatJstTimestamp(manifest.collection?.completedAt))}</dd>
       <dt>課題</dt><dd>${issues.length}</dd>
       <dt>Wiki</dt><dd>${wikis.length}</dd>
       <dt>共有ファイル</dt><dd>${sharedFiles.length}</dd>
@@ -732,7 +766,7 @@ export async function renderArchive(input) {
   `));
   await writeFileAtomically(join(paths.site, 'issues', 'index.html'), page('課題', 1, `
     <table><thead><tr><th>キー</th><th>件名</th><th>状態</th><th>担当者</th><th>更新</th></tr></thead><tbody>
-      ${issues.map(({ issue }) => `<tr><td><a href="${issue.id}.html">${escapeHtml(display(issue.issueKey))}</a></td><td>${escapeHtml(display(issue.summary))}</td><td>${escapeHtml(displayName(issue.status))}</td><td>${escapeHtml(personName(issue.assignee))}</td><td>${escapeHtml(display(issue.updated))}</td></tr>`).join('')}
+      ${issues.map(({ issue }) => `<tr><td><a href="${issue.id}.html">${escapeHtml(display(issue.issueKey))}</a></td><td>${escapeHtml(display(issue.summary))}</td><td>${escapeHtml(displayName(issue.status))}</td><td>${escapeHtml(personName(issue.assignee))}</td><td>${escapeHtml(formatJstTimestamp(issue.updated))}</td></tr>`).join('')}
     </tbody></table>
   `));
   for (const issueData of issues) {
@@ -752,7 +786,7 @@ export async function renderArchive(input) {
   }
   await writeFileAtomically(join(paths.site, 'wikis', 'index.html'), page('Wiki', 1, `
     <table><thead><tr><th>題名</th><th>タグ</th><th>更新</th></tr></thead><tbody>
-      ${wikis.map(({ wiki }) => `<tr><td><a href="${wiki.id}.html">${escapeHtml(display(wiki.name))}</a></td><td>${escapeHtml(displayNames(wiki.tags))}</td><td>${escapeHtml(display(wiki.updated))}</td></tr>`).join('')}
+      ${wikis.map(({ wiki }) => `<tr><td><a href="${wiki.id}.html">${escapeHtml(display(wiki.name))}</a></td><td>${escapeHtml(displayNames(wiki.tags))}</td><td>${escapeHtml(formatJstTimestamp(wiki.updated))}</td></tr>`).join('')}
     </tbody></table>
   `));
   for (const wikiData of wikis) {

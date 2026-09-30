@@ -104,7 +104,7 @@ export function normalizeSharedFile(value) {
   return {
     id: positiveInteger(source.id, 'sharedFile.id'),
     projectId: numberValue(source.projectId),
-    type: stringValue(source.type),
+    type: source.type === 'directory' ? 'dir' : stringValue(source.type),
     dir: stringValue(source.dir),
     name: stringValue(source.name),
     size: numberValue(source.size),
