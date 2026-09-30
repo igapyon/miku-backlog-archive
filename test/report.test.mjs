@@ -85,7 +85,8 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
   assert.match(html, /収集状態<\/dt><dd>incomplete<\/dd>/);
   assert.match(html, /進捗フェーズ<\/dt><dd>incomplete<\/dd>/);
-  assert.match(html, /API待機<\/dt><dd>read枠、429の待機、2026-09-12T00:02:00.000Z以降に再開<\/dd>/);
+  assert.match(html, /進捗更新<\/dt><dd>2026-09-12 09:01:00 JST<\/dd>/);
+  assert.match(html, /API待機<\/dt><dd>read枠、429の待機、2026-09-12 09:02:00 JST以降に再開<\/dd>/);
   assert.match(html, /issue:101/);
   assert.match(html, /get_issue&lt;script&gt;/);
   assert.doesNotMatch(html, /<script>/);
@@ -93,5 +94,6 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   assert.doesNotMatch(html, /must-not-render/);
   assert.match(html, /API 試行回数<\/th>/);
   assert.match(html, /<td>3<\/td>/);
+  assert.match(html, /<td>2026-09-12 09:01:00 JST<\/td>/);
   assert.doesNotMatch(html, /https?:\/\//);
 });

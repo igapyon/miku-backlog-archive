@@ -37,8 +37,8 @@ test('parses archive initialization arguments', () => {
 
 test('parses fixed Runtime verification arguments', () => {
   assert.deepEqual(
-    parseCommand(['runtime', 'verify', '--runtime', 'miku-backlog-api-runtime-0.7.10.mjs']),
-    { type: 'runtime-verify', runtimePath: 'miku-backlog-api-runtime-0.7.10.mjs' },
+    parseCommand(['runtime', 'verify', '--runtime', 'miku-backlog-api-runtime-0.8.0.mjs']),
+    { type: 'runtime-verify', runtimePath: 'miku-backlog-api-runtime-0.8.0.mjs' },
   );
 });
 

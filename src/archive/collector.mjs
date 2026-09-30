@@ -5,6 +5,7 @@ import { verifyRuntimeFile, verifyRuntimeModule } from '../backlog/runtime.mjs';
 import { writeJsonAtomically, writeWebStreamAtomically } from './atomic-write.mjs';
 import { ArchiveFormatError, normalizeBacklogDomain } from './format.mjs';
 import {
+  normalizeAttachment,
   normalizeComment,
   normalizeIssue,
   normalizeIssueSummary,
@@ -892,6 +893,102 @@ async function collectWiki({ paths, progress, runtime, env, wikiSummary, now }) 
   }
 }
 
+function unresolvedWikiAttachmentReferences(wiki) {
+  if (typeof wiki.content !== 'string') {
+    return [];
+  }
+  const references = new Set();
+  const pattern = /#(image|thumbnail)\(([^()\r\n]+)\)|#attach\(([^():\r\n]+)(?::(\d+))?\)|!\[([^\]\r\n]*)\]\[([^\]\r\n]+)\]/gu;
+  let inCodeFence = false;
+  for (const line of wiki.content.replace(/\r\n?/gu, '\n').split('\n')) {
+    if (/^```/u.test(line)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) {
+      continue;
+    }
+    for (const match of line.matchAll(pattern)) {
+      const reference = match[1] !== undefined
+        ? match[2]
+        : match[3] !== undefined
+          ? match[4] ?? match[3]
+          : match[6];
+      if (typeof reference === 'string' && reference !== '') {
+        references.add(reference);
+      }
+    }
+  }
+  return [...references].filter((reference) => !wiki.attachments.some((attachment) => (
+    /^\d+$/u.test(reference)
+      ? attachment.id === Number(reference)
+      : attachment.name === reference
+  )));
+}
+
+async function collectWikiAttachmentList({ paths, progress, runtime, env, now, wikiData }) {
+  const wiki = wikiData.wiki;
+  const key = `wiki-attachment-list:${wiki.id}`;
+  if (taskIsComplete(progress, key)) {
+    return wikiData;
+  }
+
+  const missingReferences = unresolvedWikiAttachmentReferences(wiki);
+  await beginTask(paths, progress, key, now, { wikiId: wiki.id });
+  try {
+    if (missingReferences.length === 0) {
+      await completeTask(paths, progress, key, now, {
+        wikiId: wiki.id,
+        listRequested: false,
+        unresolvedReferenceCount: 0,
+      });
+      return wikiData;
+    }
+
+    const listedAttachments = requireArray(
+      await call(runtime, 'get_wiki_attachments', { wikiId: wiki.id }, env),
+      'get_wiki_attachments',
+    );
+    const attachmentsById = new Map(wiki.attachments.map((attachment) => [attachment.id, attachment]));
+    let addedAttachmentCount = 0;
+    for (const value of listedAttachments) {
+      const attachment = normalizeAttachment(value);
+      const current = attachmentsById.get(attachment.id);
+      if (!current) {
+        attachmentsById.set(attachment.id, attachment);
+        addedAttachmentCount += 1;
+        continue;
+      }
+      attachmentsById.set(attachment.id, {
+        id: attachment.id,
+        name: current.name ?? attachment.name,
+        size: current.size ?? attachment.size,
+        createdUser: current.createdUser ?? attachment.createdUser,
+        created: current.created ?? attachment.created,
+      });
+    }
+
+    const updatedWikiData = {
+      ...wikiData,
+      wiki: { ...wiki, attachments: [...attachmentsById.values()] },
+    };
+    await writeJsonAtomically(join(paths.data, 'wikis', `${wiki.id}.json`), updatedWikiData);
+    await completeTask(paths, progress, key, now, {
+      wikiId: wiki.id,
+      listRequested: true,
+      addedAttachmentCount,
+      unresolvedReferenceCount: unresolvedWikiAttachmentReferences(updatedWikiData.wiki).length,
+    });
+    return updatedWikiData;
+  } catch (error) {
+    await failTask(paths, progress, key, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
+    return wikiData;
+  }
+}
+
 async function collectWikiAttachments({ paths, progress, runtime, env, now, assetIndex, wiki }) {
   let collectedAssetCount = 0;
   for (const attachment of wiki.attachments) {
@@ -933,9 +1030,9 @@ function normalizeSharedDirectoryPath(path) {
 }
 
 function sharedFilesApiPath(path) {
-  // Backlog's endpoint appends :path after `/metadata/`; a literal `/` becomes
-  // `//` and is rejected as an illegal path. `./` normalizes to the root route.
-  return path === '/' ? './' : path;
+  // Backlog's endpoint appends :path after `/metadata/`; keep nested paths
+  // relative so a leading slash does not create an illegal double slash.
+  return path === '/' ? './' : path.slice(1);
 }
 
 function joinSharedPath(parentPath, name, directory) {
@@ -1231,7 +1328,15 @@ export async function collectArchive(input) {
         collectedWikiCount += 1;
       }
       if (taskIsComplete(progress, `wiki:${wikiSummary.id}`)) {
-        const savedWiki = await loadWiki(join(paths.data, 'wikis', `${wikiSummary.id}.json`));
+        let savedWiki = await loadWiki(join(paths.data, 'wikis', `${wikiSummary.id}.json`));
+        savedWiki = await collectWikiAttachmentList({
+          paths,
+          progress,
+          runtime,
+          env,
+          now,
+          wikiData: savedWiki,
+        });
         collectedAssetCount += await collectWikiAttachments({
           paths,
           progress,

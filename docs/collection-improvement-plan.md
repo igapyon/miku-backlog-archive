@@ -100,7 +100,7 @@ Backlog の生ヘッダー `X-RateLimit-Reset` はUNIX秒だが、Runtime はISO
 
 同等性を確認できた場合だけ本体再利用を有効にする。情報が不足する課題は `get_issue` で補完する。必要な保存項目を得るため上流Runtimeの新操作が必要と判明した場合、その不足を記録し、P3の最適化を完了扱いしない。Runtimeを独断で更新せず、P1・P2の改善は独立して完了できるようにする。
 
-2026-09-30 の少数件実API確認では、MIGTEST01 の一覧／詳細3件を `normalizeIssue` 後に比較し、3件すべての必須項目が揃い、保存対象の差分はなかった。比較した課題IDは `36038336`、`36038330`、`36038314`。生レスポンスは保存していない。この少数確認は、全課題の一律同等性を保証するものではないため、実装は項目・配列・添付・共有ファイルの存在を個別に検査し、不足分を `get_issue` へ戻す。
+実 API の少数件比較では、一覧／詳細の正規化後の保存対象が一致した。少数件の結果だけで全課題の一律同等性は保証しないため、実装は項目・配列・添付・共有ファイルの存在を個別に検査し、不足分を `get_issue` で補完する。
 
 ### P3b：正規化済み本体を中断可能な形で保存する
 
@@ -172,22 +172,22 @@ npm test
 ### 実APIでの確認（実装と模擬検証が済んでから）
 
 1. `.env` の値を表示せず実行時環境へ渡す。CLIに `.env` 自動読込機能は追加しない。APIキーをコマンド引数に書かない。
-2. プロジェクト `MIGTEST01` の少数件で一覧／詳細を比較する。比較用スクリプトが必要なら `workplace/` に置き、同じRuntimeとレート管理を通す。全件 `collect` を少数件確認の代用にしない。
-3. 同等性に問題がなければ、保存済みの `workplace/test-migtest01-20260930` を以下のコマンドで再開する。フォルダを削除・再初期化しない。
+2. 検証用プロジェクトの少数件で一覧／詳細を比較する。比較用スクリプトが必要なら `workplace/` に置き、同じRuntimeとレート管理を通す。全件 `collect` を少数件確認の代用にしない。
+3. 同等性に問題がなければ、保存済みの中断アーカイブを以下のコマンドで再開する。出力先を削除・再初期化しない。コマンド例では、事前に `ARCHIVE_DIR` と `RUNTIME_FILE` に作業環境のパスを設定する。
 
 ```sh
-node src/cli.mjs verify --output workplace/test-migtest01-20260930
-node src/cli.mjs collect --archive workplace/test-migtest01-20260930 --runtime workplace/miku-backlog-api-runtime-0.7.10.mjs
-node src/cli.mjs verify --output workplace/test-migtest01-20260930
-node src/cli.mjs report --archive workplace/test-migtest01-20260930
-node src/cli.mjs render --archive workplace/test-migtest01-20260930
+node src/cli.mjs verify --output "$ARCHIVE_DIR"
+node src/cli.mjs collect --archive "$ARCHIVE_DIR" --runtime "$RUNTIME_FILE"
+node src/cli.mjs verify --output "$ARCHIVE_DIR"
+node src/cli.mjs report --archive "$ARCHIVE_DIR"
+node src/cli.mjs render --archive "$ARCHIVE_DIR"
 ```
 
 実装担当の環境で作業領域が見つからなければ、ローカルfixture検証までは進め、実API再開は未実施として記録する。`collect` が未完了で終了した場合は `report` で原因を確認し、`render` を成功したと報告しない。
 
 実確認の記録は操作別の呼び出し回数、待機回数・時間、429回数、完了／失敗タスク件数、保存内容の比較結果に限定する。実測に基づいて削減効果を報告し、「必ず429がなくなる」とは記載しない。
 
-2026-09-30 の実績：`MIGTEST01` の課題一覧と個別取得を3件比較し、正規化後の保存対象はすべて一致した。比較ではレート管理による待機が3回、合計約2,962 msだった。途中アーカイブ `workplace/test-migtest01-20260930` の再開は課題390件・Wiki79件・共有ファイル0件・資産94件で完了し、未完了タスクは0件。`verify` は `completed`、`report` は `failedTasks=0`、`render` は390課題・79 Wiki・共有ファイル0件で成功した。共有ファイル一覧取得時のルートパス問題もAPI側の `./` 変換で解消した。全件再開時の操作別API呼び出し数と429件数を記録する計測は行っていないため、実API全件の削減率や429減少率は主張しない。`get_issue` を省けることは、完全な一覧fixtureで呼び出し0回となる自動テストで確認した。
+実 API の少数件比較では、一覧／詳細の正規化後の保存対象が一致した。中断したアーカイブの再開後、`verify`・`report`・`render` が成功し、未完了タスクがないことを確認した。共有ファイル一覧取得時のルートパス問題は、API送信時に `./` へ変換して解消した。全件再開時の操作別API呼び出し数と429件数は記録していないため、実 API 全件の削減率や429減少率は主張しない。`get_issue` を省けることは、完全な一覧fixtureで呼び出し0回となる自動テストでも確認した。
 
 ## 最終完了条件と担当者の報告
 
