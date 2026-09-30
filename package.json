@@ -1,0 +1,18 @@
+{
+  "name": "miku-backlog-archive",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Create a local, static archive of one Backlog project.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "miku-backlog-archive": "src/cli.mjs"
+  },
+  "scripts": {
+    "check": "node --check src/cli.mjs && node --check src/archive/atomic-write.mjs && node --check src/archive/collector.mjs && node --check src/archive/format.mjs && node --check src/archive/normalize.mjs && node --check src/archive/report.mjs && node --check src/archive/render.mjs && node --check src/archive/session.mjs && node --check src/backlog/runtime.mjs",
+    "test": "node --test test/archive-session.test.mjs test/cli.test.mjs test/collector.test.mjs test/render.test.mjs test/report.test.mjs test/runtime.test.mjs"
+  },
+  "license": "Apache-2.0"
+}

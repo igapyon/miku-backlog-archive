@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Node.js
+node_modules/
+.npm-cache/
+dist/
+bundle/
+coverage/
+*.log
+npm-debug.log*
+
+# Local VS Code MCP configuration
+.vscode/mcp.json
+
+# Locally deployed Codex skills
+.codex/skills/
+
+# Local work area
+workplace/*
+!workplace/.gitkeep
