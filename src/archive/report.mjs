@@ -74,6 +74,27 @@ function failedTasks(progress) {
     .map(([key, value]) => ({ key, task: record(value), failure: record(record(value).failure) }));
 }
 
+function rateLimitWait(progress) {
+  const waiting = record(progress.waiting);
+  if (waiting.category === 'read' || waiting.category === 'search') {
+    const reason = waiting.reason === 'rate-limit'
+      ? '429の待機'
+      : waiting.reason === 'quota' ? '残り枠の待機' : '送信間隔の調整';
+    return `${waiting.category}枠、${reason}、${waiting.retryAt}以降に再開`;
+  }
+  const rateLimit = record(progress.rateLimit);
+  for (const category of ['read', 'search']) {
+    const bucket = record(rateLimit[category]);
+    const blockedUntil = bucket.blockedUntil;
+    const blockedAt = typeof blockedUntil === 'string' ? Date.parse(blockedUntil) : NaN;
+    if (Number.isFinite(blockedAt) && blockedAt > Date.now()) {
+      const reason = bucket.blockedReason === 'quota' ? '残り枠の待機' : '429の待機';
+      return `${category}枠、${reason}、${blockedUntil}以降に再開`;
+    }
+  }
+  return null;
+}
+
 function page(body) {
   return `<!doctype html>
 <html lang="ja">
@@ -99,6 +120,7 @@ function page(body) {
 export async function renderCollectionReport(input) {
   const { paths, manifest, progress } = await verifyArchive(input.output);
   const failures = failedTasks(progress);
+  const waitStatus = rateLimitWait(progress);
   const reportPath = join(paths.site, REPORT_PATH);
   const rows = failures.map(({ key, failure }) => `
       <tr>
@@ -120,6 +142,7 @@ export async function renderCollectionReport(input) {
       <dt>収集状態</dt><dd>${escapeHtml(display(manifest.collection?.status))}</dd>
       <dt>進捗フェーズ</dt><dd>${escapeHtml(display(progress.phase))}</dd>
       <dt>進捗更新</dt><dd>${escapeHtml(display(progress.updatedAt))}</dd>
+      <dt>API待機</dt><dd>${escapeHtml(display(waitStatus, '待機なし'))}</dd>
       <dt>再開が必要なタスク</dt><dd>${failures.length}</dd>
     </dl>
     <h2>失敗タスク</h2>

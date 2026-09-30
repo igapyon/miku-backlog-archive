@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { collectArchive } from '../src/archive/collector.mjs';
+import { collectArchive as collectArchiveOperation } from '../src/archive/collector.mjs';
 import { initializeArchive } from '../src/archive/session.mjs';
 
 const operationNames = [
@@ -15,6 +15,14 @@ const operationNames = [
   'download_issue_attachment', 'download_wiki_attachment', 'download_shared_file',
 ];
 const immediateWait = async () => {};
+
+function collectArchive(input) {
+  return collectArchiveOperation({ wait: immediateWait, ...input });
+}
+
+async function writeJson(path, value) {
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
+}
 
 async function temporaryArchive(t) {
   const directory = await mkdtemp(join(tmpdir(), 'miku-backlog-archive-collector-test-'));
@@ -42,10 +50,19 @@ function fixtureRuntime(responses, calls, downloads = async (operation) => {
       options.onAccess?.({ phase: 'start', operation });
       const response = await responses(operation, input);
       if (response.success === false) {
-        options.onAccess?.({ phase: 'failure', operation, httpStatus: response.httpStatus });
+        options.onAccess?.({
+          phase: 'failure',
+          operation,
+          httpStatus: response.httpStatus,
+          ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
+        });
         return { success: false, diagnostics: [{ code: response.code ?? 'UPSTREAM_ERROR' }] };
       }
-      options.onAccess?.({ phase: 'success', operation });
+      options.onAccess?.({
+        phase: 'success',
+        operation,
+        ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
+      });
       return { success: true, result: response };
     },
     async openDownload(operation, input, options) {
@@ -53,10 +70,19 @@ function fixtureRuntime(responses, calls, downloads = async (operation) => {
       options.onAccess?.({ phase: 'start', operation });
       const download = await downloads(operation, input);
       if (download.success === false) {
-        options.onAccess?.({ phase: 'failure', operation, httpStatus: download.httpStatus });
+        options.onAccess?.({
+          phase: 'failure',
+          operation,
+          httpStatus: download.httpStatus,
+          ...(download.rateLimit === undefined ? {} : { rateLimit: download.rateLimit }),
+        });
         return { success: false, diagnostics: [{ code: download.code ?? 'UPSTREAM_ERROR' }] };
       }
-      options.onAccess?.({ phase: 'success', operation });
+      options.onAccess?.({
+        phase: 'success',
+        operation,
+        ...(download.rateLimit === undefined ? {} : { rateLimit: download.rateLimit }),
+      });
       return {
         success: true,
         transfer: {
@@ -129,6 +155,18 @@ test('collects normalized issue data and skips completed tasks on resume', async
   assert.equal(JSON.stringify(savedIssue).includes('owner@example.test'), false);
   assert.deepEqual(savedIssue.relatedIssues, [{ id: 102, issueKey: 'DEMO-2', summary: 'Related', type: 'Relates' }]);
   assert.equal(savedIssue.issue.customFields[0].value.mailAddress, undefined);
+  const persistedText = await Promise.all([
+    'manifest.json',
+    'state/progress.json',
+    'state/issue-details/101.json',
+    'data/project.json',
+    'data/issues/index.json',
+    'data/issues/101.json',
+    'data/wikis/index.json',
+    'data/files/index.json',
+    'data/assets/index.json',
+  ].map((path) => readFile(join(output, path), 'utf8')));
+  assert.equal(persistedText.some((text) => text.includes('not-saved')), false);
 
   calls.length = 0;
   const resumed = await collectArchive({
@@ -140,7 +178,255 @@ test('collects normalized issue data and skips completed tasks on resume', async
   assert.deepEqual(calls, []);
 });
 
-test('retries retryable reads with bounded exponential waits', async (t) => {
+test('reuses complete issue-list data and caches its normalized detail before collecting comments', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const listIssue = {
+    ...issue,
+    keyId: 1,
+    issueType: { id: 3, name: 'Task', displayOrder: 1 },
+    status: { id: 1, name: 'Open', displayOrder: 1 },
+    priority: { id: 3, name: 'Normal' },
+    resolution: null,
+    assignee: null,
+    category: [],
+    versions: [],
+    milestone: [],
+    startDate: null,
+    dueDate: null,
+    estimatedHours: null,
+    actualHours: null,
+    parentIssueId: null,
+    created: '2026-09-07T00:00:00Z',
+    updated: '2026-09-07T01:00:00Z',
+    attachments: [{
+      id: 402,
+      name: 'evidence.txt',
+      size: 4,
+      createdUser: { id: 2, userId: 'editor', name: 'Editor', mailAddress: 'private@example.test' },
+      created: '2026-09-07T01:00:00Z',
+    }],
+    sharedFiles: [],
+  };
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [listIssue];
+    if (operation === 'get_issue') throw new Error('Complete issue-list data should be reused.');
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls, async () => ({ body: readableText('data') }));
+
+  await collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+  });
+
+  assert.equal(calls.some((call) => call.operation === 'get_issue'), false);
+  const cache = JSON.parse(await readFile(join(output, 'state', 'issue-details', '101.json'), 'utf8'));
+  assert.equal(cache.source, 'issue-list');
+  assert.equal(cache.reusable, true);
+  assert.equal(cache.issue.attachments[0].created, '2026-09-07T01:00:00Z');
+  assert.deepEqual(cache.issue.attachments[0].createdUser, { id: 2, userId: 'editor', name: 'Editor' });
+  assert.equal(JSON.stringify(cache).includes('private@example.test'), false);
+  const savedIssue = JSON.parse(await readFile(join(output, 'data', 'issues', '101.json'), 'utf8'));
+  assert.equal(savedIssue.issue.attachments[0].created, '2026-09-07T01:00:00Z');
+
+  const detailOutput = await temporaryArchive(t);
+  const detailCalls = [];
+  const detailRuntime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{
+      id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue',
+    }];
+    if (operation === 'get_issue') return listIssue;
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, detailCalls, async () => ({ body: readableText('data') }));
+  await collectArchive({
+    output: detailOutput,
+    runtime: detailRuntime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+  });
+  const detailSavedIssue = JSON.parse(await readFile(join(detailOutput, 'data', 'issues', '101.json'), 'utf8'));
+  assert.deepEqual(savedIssue.issue, detailSavedIssue.issue);
+});
+
+test('reuses an old archive without an issue-detail cache by fetching the missing issue once', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{ id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue' }];
+    if (operation === 'get_issue') return issue;
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+  const env = { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' };
+  await collectArchive({ output, runtime, env });
+
+  await rm(join(output, 'state', 'issue-details'), { recursive: true, force: true });
+  const progressPath = join(output, 'state', 'progress.json');
+  const progress = JSON.parse(await readFile(progressPath, 'utf8'));
+  delete progress.rateLimit;
+  delete progress.tasks['issue:101'];
+  progress.phase = 'incomplete';
+  await writeJson(progressPath, progress);
+  const manifestPath = join(output, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.collection.status = 'incomplete';
+  manifest.collection.completedAt = null;
+  await writeJson(manifestPath, manifest);
+
+  calls.length = 0;
+  await collectArchive({ output, runtime, env });
+
+  assert.equal(calls.filter((call) => call.operation === 'get_issues').length, 0);
+  assert.equal(calls.filter((call) => call.operation === 'get_issue').length, 1);
+  const cache = JSON.parse(await readFile(join(output, 'state', 'issue-details', '101.json'), 'utf8'));
+  assert.equal(cache.source, 'issue-detail');
+});
+
+test('re-fetches the first issue page when a detail cache exists without its index checkpoint', async (t) => {
+  const output = await temporaryArchive(t);
+  const manifest = JSON.parse(await readFile(join(output, 'manifest.json'), 'utf8'));
+  await mkdir(join(output, 'state', 'issue-details'), { recursive: true });
+  await writeJson(join(output, 'state', 'issue-details', '101.json'), {
+    schemaVersion: 'miku-backlog-archive/issue-detail-cache/v1',
+    archiveId: manifest.archive.id,
+    projectId: 8,
+    savedAt: '2026-09-07T00:00:00.000Z',
+    source: 'issue-list',
+    reusable: true,
+    issue,
+  });
+  const calls = [];
+  const runtime = fixtureRuntime(async (operation, input) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{
+      id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue',
+    }];
+    if (operation === 'get_issue') return issue;
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation} with ${JSON.stringify(input)}`);
+  }, calls);
+
+  const result = await collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+  });
+
+  assert.equal(result.issueCount, 1);
+  assert.deepEqual(
+    calls.filter((call) => call.operation === 'get_issues').map((call) => call.input.offset),
+    [0],
+  );
+  const index = JSON.parse(await readFile(join(output, 'data', 'issues', 'index.json'), 'utf8'));
+  assert.deepEqual(index.issues.map((entry) => entry.id), [101]);
+});
+
+test('rejects a cache belonging to another archive without overwriting the saved issue', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{ id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue' }];
+    if (operation === 'get_issue') return issue;
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+  const env = { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' };
+  await collectArchive({ output, runtime, env });
+
+  const issuePath = join(output, 'data', 'issues', '101.json');
+  const savedBefore = await readFile(issuePath, 'utf8');
+  const cachePath = join(output, 'state', 'issue-details', '101.json');
+  const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+  cache.archiveId = 'another-archive';
+  await writeJson(cachePath, cache);
+  const progressPath = join(output, 'state', 'progress.json');
+  const progress = JSON.parse(await readFile(progressPath, 'utf8'));
+  delete progress.tasks['issue:101'];
+  progress.phase = 'incomplete';
+  await writeJson(progressPath, progress);
+  const manifestPath = join(output, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  manifest.collection.status = 'incomplete';
+  manifest.collection.completedAt = null;
+  await writeJson(manifestPath, manifest);
+
+  calls.length = 0;
+  await assert.rejects(collectArchive({ output, runtime, env }), /Collection is incomplete/);
+
+  assert.equal(calls.some((call) => call.operation === 'get_issue'), false);
+  assert.equal(await readFile(issuePath, 'utf8'), savedBefore);
+  const failedProgress = JSON.parse(await readFile(progressPath, 'utf8'));
+  assert.equal(failedProgress.tasks['issue:101'].state, 'failed');
+  assert.match(failedProgress.tasks['issue:101'].failure.code, /LOCAL_ERROR/);
+});
+
+test('rejects corrupt or cross-project issue caches without overwriting completed issue data', async (t) => {
+  for (const cacheMutation of [
+    (cachePath) => writeFile(cachePath, '{broken json'),
+    async (cachePath) => {
+      const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+      cache.projectId = 999;
+      await writeJson(cachePath, cache);
+    },
+  ]) {
+    const output = await temporaryArchive(t);
+    const calls = [];
+    const runtime = fixtureRuntime(async (operation) => {
+      if (operation === 'get_project') return project;
+      if (operation === 'get_issues') return [{
+        id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue',
+      }];
+      if (operation === 'get_issue') return issue;
+      if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+        || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+        || operation === 'get_shared_files') return [];
+      throw new Error(`Unexpected operation ${operation}`);
+    }, calls);
+    const env = { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' };
+    await collectArchive({ output, runtime, env });
+
+    const issuePath = join(output, 'data', 'issues', '101.json');
+    const savedBefore = await readFile(issuePath, 'utf8');
+    const cachePath = join(output, 'state', 'issue-details', '101.json');
+    await cacheMutation(cachePath);
+    const progressPath = join(output, 'state', 'progress.json');
+    const progress = JSON.parse(await readFile(progressPath, 'utf8'));
+    delete progress.tasks['issue:101'];
+    progress.phase = 'incomplete';
+    await writeJson(progressPath, progress);
+    const manifestPath = join(output, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    manifest.collection.status = 'incomplete';
+    manifest.collection.completedAt = null;
+    await writeJson(manifestPath, manifest);
+
+    calls.length = 0;
+    await assert.rejects(collectArchive({ output, runtime, env }), /Collection is incomplete/);
+
+    assert.equal(calls.some((call) => call.operation === 'get_issue'), false);
+    assert.equal(await readFile(issuePath, 'utf8'), savedBefore);
+    const failedProgress = JSON.parse(await readFile(progressPath, 'utf8'));
+    assert.equal(failedProgress.tasks['issue:101'].failure.code, 'LOCAL_ERROR');
+  }
+});
+
+test('retries transient server errors with bounded exponential waits', async (t) => {
   const output = await temporaryArchive(t);
   const calls = [];
   const waits = [];
@@ -149,7 +435,7 @@ test('retries retryable reads with bounded exponential waits', async (t) => {
     if (operation === 'get_project') {
       projectAttempts += 1;
       return projectAttempts < 3
-        ? { success: false, code: 'UPSTREAM_ERROR', httpStatus: 429 }
+        ? { success: false, code: 'UPSTREAM_ERROR', httpStatus: 500 }
         : project;
     }
     if (operation === 'get_issues' || operation === 'get_wiki_pages' || operation === 'get_shared_files') {
@@ -166,7 +452,101 @@ test('retries retryable reads with bounded exponential waits', async (t) => {
   });
   assert.equal(result.projectId, 8);
   assert.equal(calls.filter((call) => call.operation === 'get_project').length, 3);
-  assert.deepEqual(waits, [1_000, 2_000]);
+  assert.deepEqual(waits.slice(0, 2), [1_000, 2_000]);
+});
+
+test('stops after three 429s, persists the cooldown, and resumes only after waiting', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const firstTime = new Date('2026-09-07T00:00:00.000Z');
+  let projectAttempts = 0;
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') {
+      projectAttempts += 1;
+      return projectAttempts <= 3
+        ? {
+          success: false,
+          code: 'UPSTREAM_ERROR',
+          httpStatus: 429,
+          rateLimit: { limit: 60, remaining: 0, resetAt: '2026-09-06T23:59:00.000Z' },
+        }
+        : project;
+    }
+    if (operation === 'get_issues' || operation === 'get_wiki_pages' || operation === 'get_shared_files') {
+      return [];
+    }
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => firstTime,
+  }), /get_project/);
+
+  assert.deepEqual(calls.map((call) => call.operation), ['get_project', 'get_project', 'get_project']);
+  const failed = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+  assert.equal(failed.tasks.project.failure.requestAttempts, 3);
+  assert.equal(failed.waiting, undefined);
+  assert.equal(failed.rateLimit.read.blockedUntil, '2026-09-07T00:01:00.000Z');
+
+  calls.length = 0;
+  const currentTime = new Date(firstTime);
+  const waits = [];
+  const progressEvents = [];
+  const resumed = await collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => currentTime,
+    wait: async (milliseconds) => {
+      waits.push(milliseconds);
+      currentTime.setTime(currentTime.valueOf() + milliseconds);
+    },
+    onProgress(event) { progressEvents.push(event); },
+  });
+  assert.equal(resumed.projectId, 8);
+  assert.equal(waits[0], 60_000);
+  assert.equal(progressEvents[0].phase, 'waiting');
+  assert.equal(progressEvents[0].reason, 'rate-limit');
+  assert.equal(calls[0].operation, 'get_project');
+});
+
+test('stops the entire collection after three download 429s without starting later tasks', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const currentTime = new Date('2026-09-07T00:00:00.000Z');
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{
+      id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue',
+    }];
+    if (operation === 'get_issue') return { ...issue, attachments: [{ id: 401, name: 'proof.png', size: 4 }] };
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls, async (operation) => {
+    assert.equal(operation, 'download_issue_attachment');
+    return { success: false, code: 'UPSTREAM_ERROR', httpStatus: 429 };
+  });
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => currentTime,
+    wait: immediateWait,
+  }), /download_issue_attachment/);
+
+  assert.equal(calls.filter((call) => call.operation === 'download_issue_attachment').length, 3);
+  assert.equal(calls.some((call) => call.operation === 'get_wiki_pages'), false);
+  assert.equal(calls.some((call) => call.operation === 'get_shared_files'), false);
+  const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+  assert.equal(progress.tasks['issue-attachment:101:401'].failure.httpStatus, 429);
+  assert.equal(progress.tasks['issue-attachment:101:401'].failure.requestAttempts, 3);
+  assert.equal(progress.rateLimit.read.blockedUntil, '2026-09-07T00:01:00.000Z');
 });
 
 test('deduplicates a resumed issue page and continues from its saved offset', async (t) => {
@@ -220,6 +600,16 @@ test('deduplicates a resumed issue page and continues from its saved offset', as
   assert.equal(interruptedProgress.tasks['issue-list'].state, 'failed');
   assert.equal(interruptedProgress.tasks['issue-list'].failure.requestAttempts, 3);
 
+  // Simulate an interruption after writing the refreshed index but before the
+  // matching offset checkpoint. The retry must merge this page by issue ID.
+  interruptedIndex.issues.push({
+    id: 101,
+    projectId: 8,
+    issueKey: 'DEMO-101',
+    summary: 'Issue 101',
+  });
+  await writeJson(join(output, 'data', 'issues', 'index.json'), interruptedIndex);
+
   calls.length = 0;
   failSecondPage = false;
   const resumed = await collectArchive({
@@ -267,7 +657,7 @@ test('records a retryable failed issue task without discarding completed project
       env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
       wait: immediateWait,
     }),
-    /Collection is incomplete/,
+    /get_issue_participants/,
   );
 
   const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
@@ -290,9 +680,69 @@ test('records a retryable failed issue task without discarding completed project
   assert.equal(calls.some((call) => call.operation === 'get_project'), false);
   assert.equal(calls.some((call) => call.operation === 'get_issues'), false);
   assert.equal(calls.some((call) => call.operation === 'get_issue_participants'), true);
+  assert.equal(calls.some((call) => call.operation === 'get_issue'), false);
   const resumedProgress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
   assert.equal(resumedProgress.phase, 'completed');
   assert.equal(resumedProgress.tasks['issue:101'].attempts, 2);
+  assert.equal(resumedProgress.waiting, undefined);
+});
+
+test('does not wait on an expired saved cooldown before the first API request', async (t) => {
+  const output = await temporaryArchive(t);
+  const progressPath = join(output, 'state', 'progress.json');
+  const progress = JSON.parse(await readFile(progressPath, 'utf8'));
+  progress.rateLimit = {
+    read: { blockedUntil: '2026-09-06T23:59:00.000Z', blockedReason: 'rate-limit' },
+  };
+  await writeJson(progressPath, progress);
+  const calls = [];
+  const waits = [];
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues' || operation === 'get_wiki_pages' || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+
+  await collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => new Date('2026-09-07T00:00:00.000Z'),
+    wait: async (milliseconds) => { waits.push(milliseconds); },
+  });
+
+  assert.equal(calls[0].operation, 'get_project');
+  assert.equal(waits.some((milliseconds) => milliseconds >= 60_000), false);
+});
+
+test('records a 404 as a single non-retryable task failure', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return [{
+      id: 101, projectId: 8, issueKey: 'DEMO-1', summary: 'First issue',
+    }];
+    if (operation === 'get_issue') {
+      return { success: false, code: 'NOT_FOUND', httpStatus: 404 };
+    }
+    if (operation === 'get_issue_comments' || operation === 'get_issue_participants'
+      || operation === 'get_related_issues' || operation === 'get_wiki_pages'
+      || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    wait: immediateWait,
+  }), /Collection is incomplete/);
+
+  assert.equal(calls.filter((call) => call.operation === 'get_issue').length, 1);
+  const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+  assert.equal(progress.tasks['issue:101'].failure.httpStatus, 404);
+  assert.equal(progress.tasks['issue:101'].failure.retryable, false);
 });
 
 function readableText(value) {
@@ -345,7 +795,7 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
         createdUser: { id: 1, userId: 'owner', name: 'Owner', mailAddress: 'owner@example.test' },
       }],
     };
-    if (operation === 'get_shared_files' && input.path === '/') return [
+    if (operation === 'get_shared_files' && input.path === './') return [
       { id: 501, projectId: 8, type: 'dir', dir: '/', name: 'nested' },
       { id: 502, projectId: 8, type: 'file', dir: '/', name: 'shared?.txt', size: 6 },
     ];
@@ -385,6 +835,10 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
     collectedAssetCount: 4,
     runtime: { name: 'miku-backlog-api', version: '0.7.10' },
   });
+  assert.deepEqual(
+    calls.filter((call) => call.operation === 'get_shared_files').map((call) => call.input.path),
+    ['./', '/nested/'],
+  );
 
   const savedWiki = JSON.parse(await readFile(join(output, 'data', 'wikis', '301.json'), 'utf8'));
   assert.equal(savedWiki.wiki.createdUser, null);
@@ -456,7 +910,7 @@ test('records a failed asset download and resumes only that download', async (t)
       env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
       wait: immediateWait,
     }),
-    /Collection is incomplete/,
+    /download_shared_file/,
   );
   const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
   assert.equal(progress.tasks['shared-directory:%2F'].state, 'completed');

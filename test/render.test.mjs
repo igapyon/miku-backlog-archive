@@ -261,3 +261,16 @@ test('renders a safe offline site from completed collected data', async (t) => {
     await assertFileReferences(join(output, 'site', relativePath));
   }
 });
+
+test('treats empty Markdown list and heading markers as plain text without stalling', async (t) => {
+  const output = await preparedArchive(t);
+  const issuePath = join(output, 'data', 'issues', '101.json');
+  const issue = JSON.parse(await readFile(issuePath, 'utf8'));
+  issue.issue.description = '- \n1. \n# \nbody';
+  await writeJson(issuePath, issue);
+
+  await renderArchive({ output });
+
+  const html = await readFile(join(output, 'site', 'issues', '101.html'), 'utf8');
+  assert.match(html, /<p>- <br>1\. <br># <br>body<\/p>/);
+});
