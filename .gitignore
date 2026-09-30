@@ -9,6 +9,7 @@ bundle/
 coverage/
 *.log
 npm-debug.log*
+.env
 
 # Local VS Code MCP configuration
 .vscode/mcp.json

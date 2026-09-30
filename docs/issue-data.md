@@ -53,4 +53,20 @@ Backlog の API では、[課題情報](https://developer.nulab.com/ja/docs/back
 - スター、通知、閲覧状態など個人ごとの状態
 - コメントの `changeLog` 以外の課題更新履歴を完全に再現すること
 
+## 課題一覧からの本体再利用
+
+`get_issues` の項目は、次の条件をすべて満たす場合に限って正規化済み課題キャッシュへ保存し、`get_issue` の代わりに使います。必須プロパティの欠落は `normalizeIssue` が `null` や空配列へ補正できる場合でも「同等」と見なしません。nullableな値はプロパティ自体が存在すれば `null` を許可し、配列項目は実際の配列であることを確認します。
+
+| `normalizeIssue` の出力 | 一覧項目で再利用する条件 | 不足時の処理 |
+| --- | --- | --- |
+| `id`、`projectId`、`issueKey`、`summary` | すべてプロパティがあり、課題ID・プロジェクトIDが一覧と一致 | 一覧不整合として停止 |
+| `keyId`、`description`、`issueType`、`status`、`priority`、`resolution`、`assignee` | 各プロパティが存在する。値は正規化規則に従う | `get_issue` で補完 |
+| `category`、`versions`、`milestone`、`customFields` | プロパティが存在し、値が配列 | `get_issue` で補完 |
+| `startDate`、`dueDate`、`estimatedHours`、`actualHours`、`parentIssueId` | 各プロパティが存在する | `get_issue` で補完 |
+| `createdUser`、`created`、`updatedUser`、`updated` | 各プロパティが存在する | `get_issue` で補完 |
+| `attachments` | 配列であり、各要素に `id`、`name`、`size`、`createdUser`、`created` が存在する | `get_issue` で補完 |
+| `sharedFiles` | 配列であり、各要素にID、プロジェクト、種別、パス、名称、サイズ、作成・更新者と日時が存在する | `get_issue` で補完 |
+
+一覧・詳細の比較結果は、実APIから少数の課題を読み取り、`normalizeIssue` の結果を照合して記録します。メールアドレスなどは正規化時に除去し、生レスポンスは保存しません。キャッシュがない旧アーカイブ、要約だけの項目、必須項目を欠く項目は、これまでどおり `get_issue` を呼びます。個別取得した課題本体も後段のコメント・参加者取得より先にキャッシュするため、その先で中断しても本体を取り直しません。
+
 課題履歴の表示範囲は [docs/history-scope.md](history-scope.md) で定めます。カスタム属性の定義情報をどの単位で保存するかは、保存形式の設計でさらに具体化します。

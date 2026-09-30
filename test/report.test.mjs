@@ -11,6 +11,28 @@ async function writeJson(path, value) {
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+test('renders an older progress file without rate-limit fields', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'miku-backlog-archive-report-test-'));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, 'archive');
+  await initializeArchive({
+    output,
+    domain: 'example.backlog.com',
+    projectKey: 'DEMO',
+    now: new Date('2026-09-12T00:00:00.000Z'),
+  });
+  const paths = archivePaths(output);
+  const progress = JSON.parse(await readFile(paths.progress, 'utf8'));
+  delete progress.waiting;
+  delete progress.rateLimit;
+  await writeJson(paths.progress, progress);
+
+  assert.equal((await renderCollectionReport({ output })).failedTaskCount, 0);
+  const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
+  assert.match(html, /API待機<\/dt><dd>待機なし<\/dd>/);
+  assert.doesNotMatch(html, /429の待機/);
+});
+
 test('renders an offline, sanitized report for an incomplete collection', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'miku-backlog-archive-report-test-'));
   t.after(async () => rm(directory, { recursive: true, force: true }));
@@ -29,6 +51,13 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   const progress = JSON.parse(await readFile(paths.progress, 'utf8'));
   progress.phase = 'incomplete';
   progress.updatedAt = '2026-09-12T00:01:00.000Z';
+  progress.waiting = {
+    category: 'read',
+    reason: 'rate-limit',
+    startedAt: '2026-09-12T00:01:00.000Z',
+    retryAt: '2026-09-12T00:02:00.000Z',
+    delayMs: 60_000,
+  };
   progress.tasks = {
     'issue:101': {
       state: 'failed',
@@ -56,6 +85,7 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
   assert.match(html, /収集状態<\/dt><dd>incomplete<\/dd>/);
   assert.match(html, /進捗フェーズ<\/dt><dd>incomplete<\/dd>/);
+  assert.match(html, /API待機<\/dt><dd>read枠、429の待機、2026-09-12T00:02:00.000Z以降に再開<\/dd>/);
   assert.match(html, /issue:101/);
   assert.match(html, /get_issue&lt;script&gt;/);
   assert.doesNotMatch(html, /<script>/);

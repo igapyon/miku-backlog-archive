@@ -32,10 +32,12 @@
     assets/style.css
   state/
     progress.json
+    issue-details/<issue-id>.json
 ```
 
 - `manifest.json` はアーカイブの同一性と、取得元を保持する不変に近い記録です。
 - `state/progress.json` は取得の進捗・失敗を保持します。収集処理はこのファイルを更新して中断後に再開します。
+- `state/issue-details/` は課題一覧または個別取得から正規化した課題本体を一件ずつ原子的に保存する補助キャッシュです。アーカイブID・プロジェクトIDが一致し、一覧項目の必須情報が揃う場合に限り `get_issue` の代わりに使います。旧アーカイブでキャッシュがない場合は個別取得します。
 - `data/` は正規化した JSON、`assets/` は添付・共有ファイルなどのバイナリ、`site/` は生成済み静的 HTML を置く予約領域です。
 - `data/issues/` には課題一覧と、課題本体・コメント・参加者・関連課題を、`data/wikis/` には現在版 Wiki の一覧と本体を置きます。
 - `data/files/index.json` は共有ファイルのディレクトリ構成とファイル情報を保持します。`data/assets/index.json` は各ダウンロード済みファイルの ID、元の名前、サイズ、`assets/` から始まるローカル相対パスを対応づけます。
@@ -55,7 +57,7 @@
   "archive": {
     "id": "UUID",
     "createdAt": "2026-09-07T00:00:00.000Z",
-    "toolVersion": "0.1.0"
+    "toolVersion": "0.5.0"
   },
   "source": {
     "domain": "example.backlog.com",
@@ -93,6 +95,10 @@
 ```
 
 `tasks` は取得単位ごとの状態を持ちます。現在は `project`、`issue-list`、`issue:<id>`、`wiki-list`、`wiki:<id>`、`issue-attachment:<issue-id>:<attachment-id>`、`wiki-attachment:<wiki-id>:<attachment-id>`、`shared-directory:<encoded-path>`、`shared-file:<id>` を使います。状態は `running`、`completed`、`failed` のいずれかです。`failed` のタスクは、失敗した操作・安全な対象 ID・HTTP 状態（得られる場合）・再試行可否・API 試行回数を `failures` にも記録し、次回の `collect` で再取得します。
+
+`rateLimit` は任意項目で、`read` と `search` ごとの `limit`、`remaining`、`resetAt`、`nextAllowedAt`、`blockedUntil`、`blockedReason` を記録します。`blockedReason` は `rate-limit`（429）または `quota`（成功応答で残数1以下）です。不正な値は検証で拒否し、旧progressに項目がなくても読み込めます。429で3回目の試行に失敗した場合は収集全体を止めますが、次回実行時に最初のAPIより前に `blockedUntil` まで待機します。`waiting` は待機中だけの任意項目で、枠・理由（`rate-limit`、`quota`、`pacing`、`retry`）・開始日時・再開予定日時・待機時間を持ちます。待機後に消し、429失敗後に残す期限は `rateLimit` 側で保持します。
+
+課題本体キャッシュ `state/issue-details/<issue-id>.json` は `schemaVersion: miku-backlog-archive/issue-detail-cache/v1`、`archiveId`、`projectId`、`savedAt`、`source`（`issue-list` または `issue-detail`）、`reusable`、正規化済みの `issue` を持ちます。生レスポンスを含めません。読み込み時はスキーマ、アーカイブ／プロジェクト／課題IDを照合し、不一致や破損は収集を停止します。
 
 共有ファイルはルート `/` から一つのディレクトリずつ列挙し、見つかった子ディレクトリを同じ方式で辿ります。各ディレクトリのページング位置もタスクに保存するため、中断後は確定済みの一覧とファイル本体を使い、未完了の一覧・ダウンロードだけを再開します。
 

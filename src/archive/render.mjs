@@ -258,10 +258,10 @@ function renderText(value, links, attachmentLinks) {
 
 function blockType(line) {
   if (/^```/u.test(line)) return 'code';
-  if (/^#{1,6}\s+/u.test(line)) return 'heading';
+  if (/^#{1,6}\s+.+$/u.test(line)) return 'heading';
   if (/^>\s?/u.test(line)) return 'quote';
-  if (/^[-*+]\s+/u.test(line)) return 'unordered-list';
-  if (/^\d+\.\s+/u.test(line)) return 'ordered-list';
+  if (/^[-*+]\s+.+$/u.test(line)) return 'unordered-list';
+  if (/^\d+\.\s+.+$/u.test(line)) return 'ordered-list';
   return null;
 }
 
