@@ -7,6 +7,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { renderArchive } from '../src/archive/render.mjs';
 import { initializeArchive } from '../src/archive/session.mjs';
+import { formatJstTimestamp } from '../src/archive/time.mjs';
+
+test('formats UTC timestamps in JST and keeps invalid values readable', () => {
+  assert.equal(formatJstTimestamp('2022-08-23T04:38:51Z'), '2022-08-23 13:38:51 JST');
+  assert.equal(formatJstTimestamp('not-a-timestamp'), 'not-a-timestamp');
+  assert.equal(formatJstTimestamp(null), '—');
+});
 
 async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true });
@@ -72,7 +79,7 @@ async function preparedArchive(t) {
       projectId: 8,
       issueKey: 'DEMO-1',
       summary: 'First issue',
-      description: '# 見出し\n\n- DEMO-1\n- #image(401)\n\n> 引用\n\n```\n#image(401)\n```\n\n<script>alert(1)</script> See DEMO-1, #image(401), #thumbnail(issue.png), #attach(issue.png:401), ![inline][issue.png], #image(資料 & <.png), #image(duplicate.png), #image(999), ![external](https://example.test/remote.png), and https://user:secret@example.test/path. See https://example.backlog.com/view/DEMO-1#comment-500 and https://example.backlog.com/view/DEMO-2, [child issue](https://example.backlog.com/view/DEMO-2), and [outside guide](https://example.test/guide), but retain https://example.backlog.com/view/DEMO-2?keep=1 and https://other.backlog.com/view/DEMO-2.',
+      description: '# 見出し\n\n- DEMO-1\n- #image(401)\n\n> 引用\n\n```\n#image(401)\n```\n\n<script>alert(1)</script> See DEMO-1, #image(401), #thumbnail(issue.png), #attach(issue.png:401), ![inline][issue.png], #image(資料 & <.png), #image(duplicate.png), #image(999), ![external](https://example.test/remote.png), and https://user:secret@example.test/path. See https://example.backlog.com/view/DEMO-1#comment-500 and https://example.backlog.com/view/DEMO-2, [child issue](https://example.backlog.com/view/DEMO-2), [shared manual](https://example.backlog.com/downloadSharedFile/DEMO/601/file.txt), [uncollected shared](https://example.backlog.com/downloadSharedFile/DEMO/602/missing.txt), [other project shared](https://example.backlog.com/downloadSharedFile/OTHER/601/file.txt), and [outside guide](https://example.test/guide), but retain https://example.backlog.com/view/DEMO-2?keep=1 and https://other.backlog.com/view/DEMO-2.',
       attachments: [
         { id: 401, name: 'issue.png', size: 3 },
         { id: 403, name: '資料 & <.png', size: 4 },
@@ -96,7 +103,7 @@ async function preparedArchive(t) {
       id: 500,
       issueId: 101,
       projectId: 8,
-      content: 'Do not activate javascript:alert(1). See #comment-500.',
+      content: 'Do not activate javascript:alert(1). See #comment-500 and [comment file](/downloadSharedFile/DEMO/601/file.txt).',
       changeLog: [{ field: 'status', newValue: 'Open' }],
       createdUser: { id: 1, userId: 'owner', name: 'Owner' },
       created: '2026-09-08T00:00:00Z',
@@ -131,7 +138,7 @@ async function preparedArchive(t) {
       id: 201,
       projectId: 8,
       name: 'Overview',
-      content: 'Wiki body; see DEMO-1, #image(402), and https://example.backlog.com/wiki/DEMO/Overview?pageId=201.',
+      content: 'Wiki body; see DEMO-1, #image(402), and https://example.backlog.com/wiki/DEMO/Overview?pageId=201. Shared file: https://example.backlog.com/downloadSharedFile/DEMO/601/file.txt.',
       tags: ['guide', 'safe'],
       updated: '2026-09-08T00:02:00Z',
       createdUser: { id: 1, userId: 'owner', name: 'Owner' },
@@ -199,6 +206,9 @@ test('renders a safe offline site from completed collected data', async (t) => {
   assert.match(issueHtml, /href="102\.html">https:\/\/example\.backlog\.com\/view\/DEMO-2<\/a>/);
   assert.match(issueHtml, /href="102\.html">child issue<\/a>/);
   assert.match(issueHtml, /href="https:\/\/example\.test\/guide" target="_blank" rel="noopener noreferrer">outside guide<\/a>/);
+  assert.match(issueHtml, /href="\.\.\/\.\.\/assets\/shared\/601-file\.txt">shared manual<\/a>/);
+  assert.match(issueHtml, /href="https:\/\/example\.backlog\.com\/downloadSharedFile\/DEMO\/602\/missing\.txt" target="_blank" rel="noopener noreferrer">uncollected shared<\/a>/);
+  assert.match(issueHtml, /href="https:\/\/example\.backlog\.com\/downloadSharedFile\/OTHER\/601\/file\.txt" target="_blank" rel="noopener noreferrer">other project shared<\/a>/);
   assert.match(issueHtml, /href="https:\/\/example\.backlog\.com\/view\/DEMO-2\?keep=1" target="_blank"/);
   assert.match(issueHtml, /href="https:\/\/other\.backlog\.com\/view\/DEMO-2" target="_blank"/);
   assert.match(issueHtml, /<a href="\.\.\/\.\.\/assets\/issues\/101\/401-issue\.png"><img class="inline-image" src="\.\.\/\.\.\/assets\/issues\/101\/401-issue\.png" alt="issue\.png" loading="lazy"><\/a>/);
@@ -209,13 +219,14 @@ test('renders a safe offline site from completed collected data', async (t) => {
   assert.match(issueHtml, /href="https:\/\/example\.test\/remote\.png" target="_blank"/);
   assert.doesNotMatch(issueHtml, /src="https:\/\/example\.test\/remote\.png"/);
   assert.match(issueHtml, /<dt>種別<\/dt><dd>課題<\/dd>/);
-  assert.match(issueHtml, /2026-09-08T00:01:00Z Editor/);
+  assert.match(issueHtml, /2026-09-08 09:01:00 JST Editor/);
   assert.match(issueHtml, /<li>Owner<\/li>/);
   assert.match(issueHtml, /&lt;untrusted&gt;/);
   assert.match(issueHtml, /変更記録/);
   assert.match(issueHtml, /href="#comment-500">#500<\/a> Owner/);
   assert.match(issueHtml, /href="#comment-500">#comment-500<\/a>/);
-  assert.match(issueHtml, /更新 2026-09-08T00:03:00Z/);
+  assert.match(issueHtml, /href="\.\.\/\.\.\/assets\/shared\/601-file\.txt">comment file<\/a>/);
+  assert.match(issueHtml, /更新 2026-09-08 09:03:00 JST/);
   assert.match(issueHtml, /href="102\.html">DEMO-2<\/a>: Child issue/);
   const childIssueHtml = await readFile(join(output, 'site', 'issues', '102.html'), 'utf8');
   assert.match(childIssueHtml, /href="101\.html">DEMO-1<\/a>/);
@@ -230,10 +241,11 @@ test('renders a safe offline site from completed collected data', async (t) => {
   assert.match(wikiHtml, /<img class="attachment-preview" src="\.\.\/\.\.\/assets\/wikis\/201\/402-wiki\.png" alt="wiki\.png" loading="lazy">/);
   assert.match(wikiHtml, /href="\.\.\/\.\.\/assets\/shared\/601-file\.txt">file\.txt<\/a>/);
   assert.match(wikiHtml, /href="\.\.\/issues\/101\.html">DEMO-1<\/a>/);
+  assert.match(wikiHtml, /href="\.\.\/\.\.\/assets\/shared\/601-file\.txt">https:\/\/example\.backlog\.com\/downloadSharedFile\/DEMO\/601\/file\.txt<\/a>\./);
   assert.match(wikiHtml, /href="201\.html">https:\/\/example\.backlog\.com\/wiki\/DEMO\/Overview\?pageId=201<\/a>/);
   assert.match(wikiHtml, /<a href="\.\.\/\.\.\/assets\/wikis\/201\/402-wiki\.png"><img class="inline-image" src="\.\.\/\.\.\/assets\/wikis\/201\/402-wiki\.png" alt="wiki\.png" loading="lazy"><\/a>/);
   assert.match(wikiHtml, /<dt>タグ<\/dt><dd>guide, safe<\/dd>/);
-  assert.match(wikiHtml, /2026-09-08T00:02:00Z Editor/);
+  assert.match(wikiHtml, /2026-09-08 09:02:00 JST Editor/);
   const fileHtml = await readFile(join(output, 'site', 'files', 'index.html'), 'utf8');
   assert.match(fileHtml, /href="\.\.\/\.\.\/assets\/shared\/601-file\.txt"/);
   assert.match(fileHtml, /id="directory-%2Fnested%2F"/);
@@ -241,11 +253,11 @@ test('renders a safe offline site from completed collected data', async (t) => {
   const homeHtml = await readFile(join(output, 'site', 'index.html'), 'utf8');
   assert.match(homeHtml, /href="issues\/index\.html"/);
   assert.match(homeHtml, /<dt>取得元<\/dt><dd>example\.backlog\.com<\/dd>/);
-  assert.match(homeHtml, /2026-09-08T00:01:00.000Z/);
+  assert.match(homeHtml, /2026-09-08 09:01:00 JST/);
   assert.match(homeHtml, /<dt>保存ファイル<\/dt><dd>6<\/dd>/);
   const issueIndexHtml = await readFile(join(output, 'site', 'issues', 'index.html'), 'utf8');
   assert.match(issueIndexHtml, /<th>状態<\/th><th>担当者<\/th><th>更新<\/th>/);
-  assert.match(issueIndexHtml, /<td>Open<\/td><td>—<\/td><td>2026-09-08T00:01:00Z<\/td>/);
+  assert.match(issueIndexHtml, /<td>Open<\/td><td>—<\/td><td>2026-09-08 09:01:00 JST<\/td>/);
   const wikiIndexHtml = await readFile(join(output, 'site', 'wikis', 'index.html'), 'utf8');
   assert.match(wikiIndexHtml, /<th>タグ<\/th>/);
   assert.match(wikiIndexHtml, /guide, safe/);
@@ -260,4 +272,17 @@ test('renders a safe offline site from completed collected data', async (t) => {
   ]) {
     await assertFileReferences(join(output, 'site', relativePath));
   }
+});
+
+test('treats empty Markdown list and heading markers as plain text without stalling', async (t) => {
+  const output = await preparedArchive(t);
+  const issuePath = join(output, 'data', 'issues', '101.json');
+  const issue = JSON.parse(await readFile(issuePath, 'utf8'));
+  issue.issue.description = '- \n1. \n# \nbody';
+  await writeJson(issuePath, issue);
+
+  await renderArchive({ output });
+
+  const html = await readFile(join(output, 'site', 'issues', '101.html'), 'utf8');
+  assert.match(html, /<p>- <br>1\. <br># <br>body<\/p>/);
 });

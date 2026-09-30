@@ -77,7 +77,7 @@ export function createInitialManifest(input) {
     archive: {
       id: randomUUID(),
       createdAt: now.toISOString(),
-      toolVersion: input.toolVersion ?? '0.1.0',
+      toolVersion: input.toolVersion ?? '0.6.0',
     },
     source: {
       domain: normalizeBacklogDomain(input.domain),
@@ -151,6 +151,52 @@ export function validateManifest(value) {
   return /** @type {typeof value} */ (value);
 }
 
+function isTimestamp(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/u.test(value)
+    && Number.isFinite(Date.parse(value));
+}
+
+function validateRateLimitState(progress) {
+  if (progress.rateLimit !== undefined) {
+    if (!progress.rateLimit || typeof progress.rateLimit !== 'object' || Array.isArray(progress.rateLimit)) {
+      throw new ArchiveFormatError('progress.json has invalid rate-limit state.');
+    }
+    for (const category of ['read', 'search']) {
+      const bucket = progress.rateLimit[category];
+      if (bucket === undefined) {
+        continue;
+      }
+      if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) {
+        throw new ArchiveFormatError(`progress.json has invalid ${category} rate-limit state.`);
+      }
+      for (const key of ['limit', 'remaining']) {
+        if (bucket[key] !== undefined && (!Number.isSafeInteger(bucket[key]) || bucket[key] < 0)) {
+          throw new ArchiveFormatError(`progress.json has invalid rate-limit ${key}.`);
+        }
+      }
+      for (const key of ['resetAt', 'nextAllowedAt', 'blockedUntil']) {
+        if (bucket[key] !== undefined && !isTimestamp(bucket[key])) {
+          throw new ArchiveFormatError(`progress.json has invalid rate-limit ${key}.`);
+        }
+      }
+      if (bucket.blockedReason !== undefined && !['rate-limit', 'quota'].includes(bucket.blockedReason)) {
+        throw new ArchiveFormatError(`progress.json has invalid rate-limit reason.`);
+      }
+    }
+  }
+
+  if (progress.waiting !== undefined) {
+    const waiting = progress.waiting;
+    if (!waiting || typeof waiting !== 'object' || Array.isArray(waiting)
+      || !['read', 'search'].includes(waiting.category)
+      || !['pacing', 'rate-limit', 'quota', 'retry'].includes(waiting.reason)
+      || !isTimestamp(waiting.startedAt) || !isTimestamp(waiting.retryAt)
+      || !Number.isSafeInteger(waiting.delayMs) || waiting.delayMs <= 0) {
+      throw new ArchiveFormatError('progress.json has invalid API waiting state.');
+    }
+  }
+}
+
 /**
  * @param {unknown} value
  * @param {string} archiveId
@@ -170,6 +216,7 @@ export function validateProgress(value, archiveId) {
   if (typeof progress.phase !== 'string' || progress.phase === '') {
     throw new ArchiveFormatError('progress.json has no phase.');
   }
+  validateRateLimitState(progress);
 
   return /** @type {typeof value} */ (value);
 }

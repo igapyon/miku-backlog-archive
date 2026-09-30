@@ -5,6 +5,7 @@ import { verifyRuntimeFile, verifyRuntimeModule } from '../backlog/runtime.mjs';
 import { writeJsonAtomically, writeWebStreamAtomically } from './atomic-write.mjs';
 import { ArchiveFormatError, normalizeBacklogDomain } from './format.mjs';
 import {
+  normalizeAttachment,
   normalizeComment,
   normalizeIssue,
   normalizeIssueSummary,
@@ -15,6 +16,7 @@ import {
   normalizeWiki,
   normalizeWikiSummary,
 } from './normalize.mjs';
+import { createRateLimitScheduler } from './rate-limit.mjs';
 import { verifyArchive } from './session.mjs';
 
 const ISSUE_PAGE_SIZE = 100;
@@ -29,7 +31,15 @@ const ASSET_INDEX_SCHEMA = 'miku-backlog-archive/asset-index/v1';
 const SHARED_FILE_PAGE_SIZE = 1_000;
 const MAX_REQUEST_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 1_000;
-const retryControls = new WeakMap();
+const requestControls = new WeakMap();
+const ISSUE_DETAIL_CACHE_SCHEMA = 'miku-backlog-archive/issue-detail-cache/v1';
+const REQUIRED_ISSUE_FIELDS = [
+  'id', 'projectId', 'issueKey', 'summary', 'keyId', 'description', 'issueType',
+  'status', 'priority', 'resolution', 'assignee', 'category', 'versions', 'milestone',
+  'startDate', 'dueDate', 'estimatedHours', 'actualHours', 'parentIssueId',
+  'createdUser', 'created', 'updatedUser', 'updated', 'customFields', 'attachments',
+  'sharedFiles',
+];
 
 export class ArchiveCollectionError extends Error {
   constructor(message) {
@@ -48,6 +58,14 @@ class OperationFailure extends ArchiveCollectionError {
   }
 }
 
+class RateLimitExhaustedError extends OperationFailure {
+  constructor(failure) {
+    super(failure.operation, failure.target, failure.code, failure.httpStatus);
+    this.requestAttempts = failure.requestAttempts;
+    this.stopCollection = true;
+  }
+}
+
 function waitFor(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -56,24 +74,35 @@ function retryDelay(attempt) {
   return RETRY_DELAY_MS * 2 ** (attempt - 1);
 }
 
-function retryControl(runtime) {
-  return retryControls.get(runtime) ?? { wait: waitFor };
+function requestControl(runtime) {
+  return requestControls.get(runtime) ?? null;
 }
 
-async function retryRequest(runtime, request) {
-  const control = retryControl(runtime);
+async function retryRequest(runtime, operation, request) {
+  const control = requestControl(runtime);
   for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
     try {
       return await request();
     } catch (error) {
-      if (!(error instanceof OperationFailure) || !isRetryable(error.httpStatus, error.code)
-        || attempt === MAX_REQUEST_ATTEMPTS) {
-        if (error instanceof OperationFailure) {
-          error.requestAttempts = attempt;
-        }
+      if (!(error instanceof OperationFailure) || !isRetryable(error.httpStatus, error.code)) {
         throw error;
       }
-      await control.wait(retryDelay(attempt));
+      error.requestAttempts = attempt;
+      if (error.httpStatus === 429 && attempt === MAX_REQUEST_ATTEMPTS) {
+        throw new RateLimitExhaustedError(error);
+      }
+      if (attempt === MAX_REQUEST_ATTEMPTS) {
+        throw error;
+      }
+      if (control) {
+        await control.scheduler.waitBefore(
+          operation,
+          error.httpStatus === 429 ? 'rate-limit' : 'retry',
+          error.httpStatus === 429 ? 0 : retryDelay(attempt),
+        );
+      } else {
+        await waitFor(error.httpStatus === 429 ? 60_000 : retryDelay(attempt));
+      }
     }
   }
   throw new ArchiveCollectionError('Request retry loop ended unexpectedly.');
@@ -192,7 +221,26 @@ function safeTarget(input) {
   return target;
 }
 
+async function recordAccessEvents(runtime, operation, accessEvents) {
+  const control = requestControl(runtime);
+  if (!control) {
+    return;
+  }
+  for (const event of accessEvents) {
+    control.scheduler.observe(operation, event);
+  }
+  control.progress.rateLimit = control.scheduler.snapshot();
+  if (accessEvents.some((event) => event?.phase === 'failure' && event.httpStatus === 429)) {
+    updateTimestamp(control.progress, control.now);
+    await saveProgress(control.paths, control.progress);
+  }
+}
+
 async function callOnce(runtime, operation, input, env) {
+  const control = requestControl(runtime);
+  if (control) {
+    await control.scheduler.waitBefore(operation);
+  }
   const accessEvents = [];
   let response;
   try {
@@ -204,8 +252,17 @@ async function callOnce(runtime, operation, input, env) {
       },
     });
   } catch {
-    throw new OperationFailure(operation, safeTarget(input), 'RUNTIME_ERROR');
+    await recordAccessEvents(runtime, operation, accessEvents);
+    const accessFailure = accessEvents.find((event) => event?.phase === 'failure');
+    throw new OperationFailure(
+      operation,
+      safeTarget(input),
+      'RUNTIME_ERROR',
+      Number.isFinite(accessFailure?.httpStatus) ? accessFailure.httpStatus : undefined,
+    );
   }
+
+  await recordAccessEvents(runtime, operation, accessEvents);
 
   if (!response || response.success !== true) {
     const diagnostic = response?.diagnostics?.[0];
@@ -221,10 +278,14 @@ async function callOnce(runtime, operation, input, env) {
 }
 
 async function call(runtime, operation, input, env) {
-  return retryRequest(runtime, () => callOnce(runtime, operation, input, env));
+  return retryRequest(runtime, operation, () => callOnce(runtime, operation, input, env));
 }
 
 async function openDownloadOnce(runtime, operation, input, env) {
+  const control = requestControl(runtime);
+  if (control) {
+    await control.scheduler.waitBefore(operation);
+  }
   const accessEvents = [];
   let response;
   try {
@@ -236,8 +297,17 @@ async function openDownloadOnce(runtime, operation, input, env) {
       },
     });
   } catch {
-    throw new OperationFailure(operation, safeTarget(input), 'RUNTIME_ERROR');
+    const accessFailure = accessEvents.find((event) => event?.phase === 'failure');
+    await recordAccessEvents(runtime, operation, accessEvents);
+    throw new OperationFailure(
+      operation,
+      safeTarget(input),
+      'RUNTIME_ERROR',
+      Number.isFinite(accessFailure?.httpStatus) ? accessFailure.httpStatus : undefined,
+    );
   }
+
+  await recordAccessEvents(runtime, operation, accessEvents);
 
   if (!response || response.success !== true) {
     const diagnostic = response?.diagnostics?.[0];
@@ -259,7 +329,7 @@ async function openDownloadOnce(runtime, operation, input, env) {
 }
 
 async function openDownload(runtime, operation, input, env) {
-  return retryRequest(runtime, () => openDownloadOnce(runtime, operation, input, env));
+  return retryRequest(runtime, operation, () => openDownloadOnce(runtime, operation, input, env));
 }
 
 function requireArray(value, operation) {
@@ -333,7 +403,69 @@ async function loadIssueIndex(path) {
   return value.issues;
 }
 
-async function collectIssueIndex({ paths, progress, runtime, env, projectId, now }) {
+function issueHasCompleteListDetail(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !REQUIRED_ISSUE_FIELDS.every((key) => Object.hasOwn(value, key))) {
+    return false;
+  }
+  for (const key of ['category', 'versions', 'milestone', 'customFields', 'attachments', 'sharedFiles']) {
+    if (!Array.isArray(value[key])) {
+      return false;
+    }
+  }
+  if (!value.attachments.every((attachment) => attachment && typeof attachment === 'object'
+    && ['id', 'name', 'size', 'createdUser', 'created']
+      .every((key) => Object.hasOwn(attachment, key)))) {
+    return false;
+  }
+  const sharedFileFields = [
+    'id', 'projectId', 'type', 'dir', 'name', 'size', 'createdUser', 'created',
+    'updatedUser', 'updated',
+  ];
+  return value.sharedFiles.every((file) => file && typeof file === 'object'
+    && sharedFileFields.every((key) => Object.hasOwn(file, key)));
+}
+
+function issueDetailCachePath(paths, issueId) {
+  return join(paths.state, 'issue-details', `${issueId}.json`);
+}
+
+async function saveIssueDetailCache({ paths, archiveId, projectId, issue, source, reusable, now }) {
+  await writeJsonAtomically(issueDetailCachePath(paths, issue.id), {
+    schemaVersion: ISSUE_DETAIL_CACHE_SCHEMA,
+    archiveId,
+    projectId,
+    savedAt: nowIso(now),
+    source,
+    reusable,
+    issue,
+  });
+}
+
+async function loadIssueDetailCache({ paths, archiveId, projectId, issueId }) {
+  let value;
+  try {
+    value = JSON.parse(await readFile(issueDetailCachePath(paths, issueId), 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return null;
+    }
+    throw new ArchiveCollectionError(`Could not read issue detail cache ${issueId}.`);
+  }
+  if (!value || value.schemaVersion !== ISSUE_DETAIL_CACHE_SCHEMA
+    || value.archiveId !== archiveId || value.projectId !== projectId
+    || !['issue-list', 'issue-detail'].includes(value.source)
+    || typeof value.reusable !== 'boolean' || !value.issue || typeof value.issue !== 'object') {
+    throw new ArchiveCollectionError(`Issue detail cache ${issueId} has an unsupported format.`);
+  }
+  const issue = normalizeIssue(value.issue);
+  if (issue.id !== issueId || issue.projectId !== projectId) {
+    throw new ArchiveCollectionError(`Issue detail cache ${issueId} has a mismatched identity.`);
+  }
+  return { issue, reusable: value.reusable };
+}
+
+async function collectIssueIndex({ paths, progress, runtime, env, projectId, archiveId, now }) {
   const key = 'issue-list';
   const indexPath = join(paths.data, 'issues', 'index.json');
   if (taskIsComplete(progress, key)) {
@@ -341,6 +473,7 @@ async function collectIssueIndex({ paths, progress, runtime, env, projectId, now
   }
 
   await mkdir(join(paths.data, 'issues'), { recursive: true });
+  await mkdir(join(paths.state, 'issue-details'), { recursive: true });
   const existing = new Map();
   try {
     for (const issue of await loadIssueIndex(indexPath)) {
@@ -366,6 +499,17 @@ async function collectIssueIndex({ paths, progress, runtime, env, projectId, now
         if (summary.projectId !== projectId) {
           throw new ArchiveCollectionError('Issue list contains a different project.');
         }
+        const issue = normalizeIssue(value);
+        const reusable = issueHasCompleteListDetail(value);
+        await saveIssueDetailCache({
+          paths,
+          archiveId,
+          projectId,
+          issue,
+          source: 'issue-list',
+          reusable,
+          now,
+        });
         existing.set(summary.id, summary);
       }
       offset += page.length;
@@ -426,7 +570,7 @@ async function collectComments(runtime, issueId, env) {
   }
 }
 
-async function collectIssue({ paths, progress, runtime, env, issueSummary, now }) {
+async function collectIssue({ paths, progress, runtime, env, archiveId, issueSummary, now }) {
   const key = `issue:${issueSummary.id}`;
   if (taskIsComplete(progress, key)) {
     return false;
@@ -436,7 +580,30 @@ async function collectIssue({ paths, progress, runtime, env, issueSummary, now }
     issueKey: issueSummary.issueKey,
   });
   try {
-    const issue = normalizeIssue(await call(runtime, 'get_issue', { issueId: issueSummary.id }, env));
+    const cached = await loadIssueDetailCache({
+      paths,
+      archiveId,
+      projectId: issueSummary.projectId,
+      issueId: issueSummary.id,
+    });
+    let issue;
+    if (cached?.reusable) {
+      issue = cached.issue;
+    } else {
+      issue = normalizeIssue(await call(runtime, 'get_issue', { issueId: issueSummary.id }, env));
+      if (issue.id !== issueSummary.id || issue.projectId !== issueSummary.projectId) {
+        throw new ArchiveCollectionError('Issue detail does not match the saved issue index.');
+      }
+      await saveIssueDetailCache({
+        paths,
+        archiveId,
+        projectId: issueSummary.projectId,
+        issue,
+        source: 'issue-detail',
+        reusable: true,
+        now,
+      });
+    }
     if (issue.id !== issueSummary.id || issue.projectId !== issueSummary.projectId) {
       throw new ArchiveCollectionError('Issue detail does not match the saved issue index.');
     }
@@ -463,6 +630,9 @@ async function collectIssue({ paths, progress, runtime, env, issueSummary, now }
     return true;
   } catch (error) {
     await failTask(paths, progress, key, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
     return false;
   }
 }
@@ -615,6 +785,9 @@ async function collectAsset({
     return true;
   } catch (error) {
     await failTask(paths, progress, taskKey, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
     return false;
   }
 }
@@ -713,7 +886,106 @@ async function collectWiki({ paths, progress, runtime, env, wikiSummary, now }) 
     return true;
   } catch (error) {
     await failTask(paths, progress, key, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
     return false;
+  }
+}
+
+function unresolvedWikiAttachmentReferences(wiki) {
+  if (typeof wiki.content !== 'string') {
+    return [];
+  }
+  const references = new Set();
+  const pattern = /#(image|thumbnail)\(([^()\r\n]+)\)|#attach\(([^():\r\n]+)(?::(\d+))?\)|!\[([^\]\r\n]*)\]\[([^\]\r\n]+)\]/gu;
+  let inCodeFence = false;
+  for (const line of wiki.content.replace(/\r\n?/gu, '\n').split('\n')) {
+    if (/^```/u.test(line)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) {
+      continue;
+    }
+    for (const match of line.matchAll(pattern)) {
+      const reference = match[1] !== undefined
+        ? match[2]
+        : match[3] !== undefined
+          ? match[4] ?? match[3]
+          : match[6];
+      if (typeof reference === 'string' && reference !== '') {
+        references.add(reference);
+      }
+    }
+  }
+  return [...references].filter((reference) => !wiki.attachments.some((attachment) => (
+    /^\d+$/u.test(reference)
+      ? attachment.id === Number(reference)
+      : attachment.name === reference
+  )));
+}
+
+async function collectWikiAttachmentList({ paths, progress, runtime, env, now, wikiData }) {
+  const wiki = wikiData.wiki;
+  const key = `wiki-attachment-list:${wiki.id}`;
+  if (taskIsComplete(progress, key)) {
+    return wikiData;
+  }
+
+  const missingReferences = unresolvedWikiAttachmentReferences(wiki);
+  await beginTask(paths, progress, key, now, { wikiId: wiki.id });
+  try {
+    if (missingReferences.length === 0) {
+      await completeTask(paths, progress, key, now, {
+        wikiId: wiki.id,
+        listRequested: false,
+        unresolvedReferenceCount: 0,
+      });
+      return wikiData;
+    }
+
+    const listedAttachments = requireArray(
+      await call(runtime, 'get_wiki_attachments', { wikiId: wiki.id }, env),
+      'get_wiki_attachments',
+    );
+    const attachmentsById = new Map(wiki.attachments.map((attachment) => [attachment.id, attachment]));
+    let addedAttachmentCount = 0;
+    for (const value of listedAttachments) {
+      const attachment = normalizeAttachment(value);
+      const current = attachmentsById.get(attachment.id);
+      if (!current) {
+        attachmentsById.set(attachment.id, attachment);
+        addedAttachmentCount += 1;
+        continue;
+      }
+      attachmentsById.set(attachment.id, {
+        id: attachment.id,
+        name: current.name ?? attachment.name,
+        size: current.size ?? attachment.size,
+        createdUser: current.createdUser ?? attachment.createdUser,
+        created: current.created ?? attachment.created,
+      });
+    }
+
+    const updatedWikiData = {
+      ...wikiData,
+      wiki: { ...wiki, attachments: [...attachmentsById.values()] },
+    };
+    await writeJsonAtomically(join(paths.data, 'wikis', `${wiki.id}.json`), updatedWikiData);
+    await completeTask(paths, progress, key, now, {
+      wikiId: wiki.id,
+      listRequested: true,
+      addedAttachmentCount,
+      unresolvedReferenceCount: unresolvedWikiAttachmentReferences(updatedWikiData.wiki).length,
+    });
+    return updatedWikiData;
+  } catch (error) {
+    await failTask(paths, progress, key, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
+    return wikiData;
   }
 }
 
@@ -755,6 +1027,12 @@ function normalizeSharedDirectoryPath(path) {
     throw new ArchiveCollectionError('Shared-file directory path is invalid.');
   }
   return path;
+}
+
+function sharedFilesApiPath(path) {
+  // Backlog's endpoint appends :path after `/metadata/`; keep nested paths
+  // relative so a leading slash does not create an illegal double slash.
+  return path === '/' ? './' : path.slice(1);
 }
 
 function joinSharedPath(parentPath, name, directory) {
@@ -826,7 +1104,7 @@ async function collectSharedDirectory({ paths, progress, runtime, env, projectId
     while (true) {
       const page = requireArray(await call(runtime, 'get_shared_files', {
         projectId,
-        path,
+        path: sharedFilesApiPath(path),
         offset,
         count: SHARED_FILE_PAGE_SIZE,
         order: 'asc',
@@ -870,6 +1148,9 @@ async function collectSharedDirectory({ paths, progress, runtime, env, projectId
     }
   } catch (error) {
     await failTask(paths, progress, key, error, now);
+    if (error?.stopCollection === true) {
+      throw error;
+    }
   }
 }
 
@@ -924,7 +1205,7 @@ function hasFailedTasks(progress) {
  * verified Runtime file or a Runtime object for tests; no direct Backlog HTTP
  * client is used here.
  *
- * @param {{ output: string, runtimePath?: string, runtime?: object, env?: Record<string, string | undefined>, now?: () => Date }} input
+ * @param {{ output: string, runtimePath?: string, runtime?: object, env?: Record<string, string | undefined>, now?: () => Date, onProgress?: (event: Record<string, unknown>) => unknown }} input
  */
 export async function collectArchive(input) {
   const now = input.now ?? (() => new Date());
@@ -938,7 +1219,50 @@ export async function collectArchive(input) {
   if (input.wait !== undefined && typeof input.wait !== 'function') {
     throw new ArchiveCollectionError('Collection wait hook must be a function.');
   }
-  retryControls.set(runtime, { wait: input.wait ?? waitFor });
+  if (input.onProgress !== undefined && typeof input.onProgress !== 'function') {
+    throw new ArchiveCollectionError('Collection progress hook must be a function.');
+  }
+  let scheduler;
+  scheduler = createRateLimitScheduler({
+    now,
+    wait: input.wait ?? waitFor,
+    async onWait(event) {
+      progress.rateLimit = scheduler.snapshot();
+      if (event.phase === 'waiting') {
+        progress.waiting = {
+          category: event.category,
+          reason: event.reason,
+          startedAt: event.startedAt,
+          retryAt: event.retryAt,
+          delayMs: event.delayMs,
+        };
+        if (event.reason === 'rate-limit' || event.delayMs >= 5_000) {
+          updateTimestamp(progress, now);
+          await saveProgress(paths, progress);
+        }
+        if (event.reason === 'rate-limit' || event.delayMs >= 5_000) {
+          await input.onProgress?.(event);
+        }
+        return;
+      }
+      const hadPersistedWait = progress.waiting !== undefined;
+      delete progress.waiting;
+      progress.rateLimit = scheduler.snapshot();
+      if (hadPersistedWait) {
+        updateTimestamp(progress, now);
+        await saveProgress(paths, progress);
+        await input.onProgress?.(event);
+      }
+    },
+  });
+  scheduler.restore(progress.rateLimit);
+  if (progress.waiting && Date.parse(progress.waiting.retryAt) <= now().valueOf()) {
+    delete progress.waiting;
+    progress.rateLimit = scheduler.snapshot();
+    updateTimestamp(progress, now);
+    await saveProgress(paths, progress);
+  }
+  requestControls.set(runtime, { scheduler, paths, progress, now });
 
   manifest.collection.status = 'collecting';
   manifest.collection.startedAt ??= nowIso(now);
@@ -962,10 +1286,26 @@ export async function collectArchive(input) {
       assetIndex.savedAt = nowIso(now);
       await writeJsonAtomically(assetIndexPath(paths), assetIndex);
     }
-    const issues = await collectIssueIndex({ paths, progress, runtime, env, projectId, now });
+    const issues = await collectIssueIndex({
+      paths,
+      progress,
+      runtime,
+      env,
+      projectId,
+      archiveId: manifest.archive.id,
+      now,
+    });
     issueCount = issues.length;
     for (const issueSummary of issues) {
-      if (await collectIssue({ paths, progress, runtime, env, issueSummary, now })) {
+      if (await collectIssue({
+        paths,
+        progress,
+        runtime,
+        env,
+        archiveId: manifest.archive.id,
+        issueSummary,
+        now,
+      })) {
         collectedIssueCount += 1;
       }
       if (taskIsComplete(progress, `issue:${issueSummary.id}`)) {
@@ -988,7 +1328,15 @@ export async function collectArchive(input) {
         collectedWikiCount += 1;
       }
       if (taskIsComplete(progress, `wiki:${wikiSummary.id}`)) {
-        const savedWiki = await loadWiki(join(paths.data, 'wikis', `${wikiSummary.id}.json`));
+        let savedWiki = await loadWiki(join(paths.data, 'wikis', `${wikiSummary.id}.json`));
+        savedWiki = await collectWikiAttachmentList({
+          paths,
+          progress,
+          runtime,
+          env,
+          now,
+          wikiData: savedWiki,
+        });
         collectedAssetCount += await collectWikiAttachments({
           paths,
           progress,
@@ -1033,6 +1381,7 @@ export async function collectArchive(input) {
   }
 
   manifest.collection.status = 'completed';
+  delete progress.waiting;
   manifest.collection.completedAt = nowIso(now);
   manifest.collection.counts = {
     issues: issueCount,

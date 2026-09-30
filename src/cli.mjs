@@ -8,9 +8,10 @@ import { collectArchive } from './archive/collector.mjs';
 import { renderCollectionReport } from './archive/report.mjs';
 import { renderArchive } from './archive/render.mjs';
 import { initializeArchive, verifyArchive } from './archive/session.mjs';
+import { formatJstTimestamp } from './archive/time.mjs';
 import { verifyRuntimeFile } from './backlog/runtime.mjs';
 
-const VERSION = '0.1.0';
+const VERSION = '0.6.0';
 
 const USAGE = `Usage:
   miku-backlog-archive init --output <directory> --source-domain <domain> --project-key <key>
@@ -182,6 +183,21 @@ export async function main(argv, io = {}) {
       const result = await collectArchive({
         output: command.output,
         runtimePath: command.runtimePath,
+        onProgress(event) {
+          if (!['read', 'search'].includes(event.category)
+            || typeof event.retryAt !== 'string'
+            || (!['rate-limit', 'quota'].includes(event.reason) && event.delayMs < 5_000)) {
+            return;
+          }
+          if (event.phase === 'waiting') {
+            const reason = event.reason === 'rate-limit'
+              ? 'レート制限'
+              : event.reason === 'quota' ? '残り枠の消化待ち' : '送信間隔の調整';
+            stderr.write(`Backlog API ${event.category}枠: ${reason}のため ${formatJstTimestamp(event.retryAt)} まで待機します。\n`);
+          } else if (event.phase === 'resumed') {
+            stderr.write(`Backlog API ${event.category}枠の待機を終了しました。\n`);
+          }
+        },
       });
       stdout.write(
         `Collection completed: projectId=${result.projectId}, issues=${result.issueCount} (new ${result.collectedIssueCount}), wikis=${result.wikiCount} (new ${result.collectedWikiCount}), sharedFiles=${result.sharedFileCount}, assets=${result.assetCount} (new ${result.collectedAssetCount})\n`,

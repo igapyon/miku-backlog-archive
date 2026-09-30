@@ -5,9 +5,9 @@ import { pathToFileURL } from 'node:url';
 
 export const PINNED_RUNTIME = Object.freeze({
   name: 'miku-backlog-api',
-  version: '0.7.10',
-  sha256: '7a8d9b78296009b204341ca49da2cd3a382f7b2bc656f607f670b69ef85601ec',
-  url: 'https://github.com/igapyon/miku-backlog-api/releases/download/v0.7.10/miku-backlog-api-runtime-0.7.10.mjs',
+  version: '0.8.0',
+  sha256: 'aaae76899998caf329838f76025206a5672fb521d1ab1cb4f5f3021bb0ed5717',
+  url: 'https://github.com/igapyon/miku-backlog-api/releases/download/v0.8.0/miku-backlog-api-runtime-0.8.0.mjs',
 });
 
 export const REQUIRED_RUNTIME_OPERATIONS = Object.freeze([
@@ -25,6 +25,7 @@ export const REQUIRED_RUNTIME_OPERATIONS = Object.freeze([
   'get_related_issues',
   'get_wiki_pages',
   'get_wiki',
+  'get_wiki_attachments',
   'get_shared_files',
   'download_issue_attachment',
   'download_wiki_attachment',
