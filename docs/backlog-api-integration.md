@@ -63,7 +63,21 @@ GitHub Release の `miku-backlog-api` Runtime をバージョン固定で利用�
 
 共有ファイルのアーカイブ内ルートは `/` です。固定RuntimeはAPIパスへ `path` をそのまま連結するため、ルート一覧を `path: "/"` で呼ぶと `//` となり、Backlogから `illegal path`（HTTP 400）が返ります。archiveはAPI呼び出し時だけ `path: "./"` を渡し、URL正規化でルート一覧へ到達させます。この形式で実 API のルート一覧を取得できることを確認しました。ローカルのディレクトリ名と保存形式は `/` のままです。
 
-最終失敗時は操作名、対象 ID、HTTP ステータスが得られる場合の状態、再試行可否、実行した API 試行回数を記録し、上流の応答本文や認証情報は記録しません。
+最終失敗時は操作名、安全な対象ID、許可した診断コード、HTTPステータスが得られる場合の状態、再試行可否、実行したAPI試行回数を記録します。現在失敗しているタスクだけをCLIと収集状況レポートへ表示します。進捗と失敗履歴にはcollectorが生成したタスク識別子を保持しますが、共有フォルダ名はCLI・HTMLのタスク表示から除外します。Runtimeの応答本文、任意の診断message、URL、ヘッダー、例外stackは診断出力・進捗に保存しません。HTTP状態のない上流エラーは「原因未特定」とし、DNS、TLS、接続拒否などに決めつけません。
+
+collectが失敗したときは、CLIのstderrに現在の失敗を最大5件表示し、過剰分は残件数でまとめます。古いprogressにHTTP状態またはAPI試行回数がない場合は「未取得」「不明」と表示します。過去の `progress.failures` 履歴は現在の失敗件数として数えません。
+
+```text
+miku-backlog-archive: Collection is incomplete (failed tasks: 1).
+task=project, operation=get_project, target={"projectKey":"DEMO"}, code=UPSTREAM_ERROR, HTTP=未取得, API試行回数=3
+HTTP状態を取得できず、原因は未特定です。ネットワーク許可、ドメイン、DNS、プロキシ、TLSなどの接続設定を確認してください。
+確認: node src/cli.mjs report --archive <directory>
+設定を確認した後に、同じアーカイブでcollectを再実行してください。
+```
+
+HTTP 401は認証設定、403は権限・アクセス制限、404は対象ID・参照・権限、408は接続状態、429は保存済み待機情報、500〜599はサーバー／中継側の再試行を確認先として示します。これらも原因の確定表示ではありません。上流Runtimeが安全なHTTP前接続原因を構造化して返さない限り、HTTP状態なしの原因は未特定のままです。
+
+この診断は既存のRuntime v0.8.0のoperation codeとアクセスイベントに基づきます。miku-backlog-apiの更新や追加照会は必要としません。固定Runtimeの追加診断codeは許可集合で正規化し、Runtime生messageをCLIに表示しません。
 
 ## 参照
 

@@ -43,6 +43,8 @@
 - `data/files/index.json` は共有ファイルのディレクトリ構成とファイル情報を保持します。`data/assets/index.json` は各ダウンロード済みファイルの ID、元の名前、サイズ、`assets/` から始まるローカル相対パスを対応づけます。
 - `assets/` 内の名前は ID を先頭に付け、区切り文字、制御文字、危険な相対パス、OS で使えない文字を安全な名前へ置換します。表示用の元の名前は JSON 側に保持します。元の名前をローカルパスとして使用しません。
 - `site/` は `render` が、完了済みアーカイブの `data/` と `assets/` だけを使って生成します。セマンティックな HTML と Material Design 3 を参照した CSS を出力し、共通 CSS のソースは `src/ui/tokens.css` と `src/ui/archive.css` です。`site/assets/style.css` は CLI 実行時にこの2ファイルから生成します。ページを開いた時に Backlog や CDN へ自動接続しません。本文中の通常の外部リンクは、利用者がクリックした時だけ遷移します。許可した記法だけを安全に HTML 化し、取得済みWikiの一意な題名に一致する `[[Wikiページ名]]` はホーム説明・課題説明・課題コメント・Wiki本文から相対HTMLリンクにします。保存済み添付への限定的な画像・添付参照、取得済み課題キー、見出し・リスト・引用・コードフェンスにも対応します。外部画像は自動読込しません。共有ファイルは `data/files/index.json` のフォルダ階層を入れ子のページ内ツリーとして表示します。
+- `site/` の相対リンクはアーカイブ全体を配信ルートにする配置です。ローカルHTTPで閲覧する場合は `<archive-root>` をルートとして配信し、`/site/index.html` を開きます。`site/` 単体をルートにしてもHTMLとCSSは読めますが、`<archive-root>/assets/` を参照する添付・共有ファイルリンクは解決しません。閲覧手順と確認済み範囲は [READMEのローカル閲覧資料](../README.md) から [詳細手順](viewing.md) を参照してください。`file://` の可否はブラウザー・OS・起動方法ごとに確認し、環境全体へ一般化しません。
+- HTTPでアーカイブ全体を配信する方法はローカル確認用です。配信対象には `data/`、`state/`、manifest、保存ファイルが含まれます。公開または他者との共有には、公開範囲とアクセス制御を別途設計してください。
 - `site/collection-status.html` は `render` の最後に生成される完成済みアーカイブの収集状況ページです。単独の `report` は完了前でも実行でき、manifest と `state/progress.json` からレポートを生成・更新します。現在 `failed` のタスクの操作、許可済みの対象 ID、HTTP 状態、再試行可否、API 試行回数を表示します。過去の失敗履歴や許可外の進捗フィールドは表示しません。閲覧画面と共通の `site/assets/style.css` を使い、存在が確認できるページへのリンクだけをメニューに表示します。
 
 初期化時点では、プロジェクトキーは分かっていても数値 ID はまだ未解決です。そのため `source.project.id` は `null` です。収集の開始前に `miku-backlog-api` から解決した ID を記録し、再開時は domain と ID を照合します。
@@ -57,7 +59,7 @@
   "archive": {
     "id": "UUID",
     "createdAt": "2026-09-07T00:00:00.000Z",
-    "toolVersion": "0.7.1"
+    "toolVersion": "0.7.2"
   },
   "source": {
     "domain": "example.backlog.com",
@@ -94,7 +96,9 @@
 }
 ```
 
-`tasks` は取得単位ごとの状態を持ちます。現在は `project`、`issue-list`、`issue:<id>`、`wiki-list`、`wiki:<id>`、`wiki-attachment-list:<wiki-id>`、`issue-attachment:<issue-id>:<attachment-id>`、`wiki-attachment:<wiki-id>:<attachment-id>`、`shared-directory:<encoded-path>`、`shared-file:<id>` を使います。`wiki-attachment-list:<wiki-id>` は、Wiki 本文に添付一覧の不足参照があるかを確認した結果も記録し、旧アーカイブの再開時にも未実施なら補完処理を行います。状態は `running`、`completed`、`failed` のいずれかです。`failed` のタスクは、失敗した操作・安全な対象 ID・HTTP 状態（得られる場合）・再試行可否・API 試行回数を `failures` にも記録し、次回の `collect` で再取得します。
+`tasks` は取得単位ごとの状態を持ちます。現在は `project`、`issue-list`、`issue:<id>`、`wiki-list`、`wiki:<id>`、`wiki-attachment-list:<wiki-id>`、`issue-attachment:<issue-id>:<attachment-id>`、`wiki-attachment:<wiki-id>:<attachment-id>`、`shared-directory:<encoded-path>`、`shared-file:<id>` を使います。`wiki-attachment-list:<wiki-id>` は、Wiki 本文に添付一覧の不足参照があるかを確認した結果も記録し、旧アーカイブの再開時にも未実施なら補完処理を行います。状態は `running`、`completed`、`failed` のいずれかです。`failed` のタスクは、失敗した操作・安全な対象 ID・許可コード・HTTP 状態（得られる場合）・再試行可否・API 試行回数を `failures` にも記録し、次回の `collect` で再取得します。Runtimeの自由文、URL、headers、例外情報は診断・進捗に保存しません。未知のcodeは `UNKNOWN_ERROR` に正規化します。古いprogressにHTTP状態やAPI試行回数がない場合も読み込みを続け、表示時に未取得／不明として扱います。
+
+CLIと収集状況レポートは `tasks` のうち現在 `failed` のタスクを表示し、過去履歴を現在の失敗数に加えません。CLIは最大5件までをstderrに表示し、追加分は残件数でまとめます。タスク名に含まれる共有フォルダ名は出さず、操作名・安全な対象・診断コード・HTTP状態・試行回数・一般的な確認先を表示します。HTTP状態がない場合、原因は未特定として扱います。診断処理は progress v1 の既存形式を使い、必須項目やファイル配置は追加しません。詳細は [miku-backlog-api との連携方針](backlog-api-integration.md) を参照してください。
 
 `rateLimit` は任意項目で、`read` と `search` ごとの `limit`、`remaining`、`resetAt`、`nextAllowedAt`、`blockedUntil`、`blockedReason` を記録します。`blockedReason` は `rate-limit`（429）または `quota`（成功応答で残数1以下）です。不正な値は検証で拒否し、旧progressに項目がなくても読み込めます。429で3回目の試行に失敗した場合は収集全体を止めますが、次回実行時に最初のAPIより前に `blockedUntil` まで待機します。`waiting` は待機中だけの任意項目で、枠・理由（`rate-limit`、`quota`、`pacing`、`retry`）・開始日時・再開予定日時・待機時間を持ちます。待機後に消し、429失敗後に残す期限は `rateLimit` 側で保持します。
 

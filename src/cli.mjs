@@ -5,13 +5,14 @@ import { resolve } from 'node:path';
 
 import { ArchiveFormatError } from './archive/format.mjs';
 import { collectArchive } from './archive/collector.mjs';
+import { formatCollectionError } from './archive/diagnostics.mjs';
 import { renderCollectionReport } from './archive/report.mjs';
 import { renderArchive } from './archive/render.mjs';
 import { initializeArchive, verifyArchive } from './archive/session.mjs';
 import { formatJstTimestamp } from './archive/time.mjs';
 import { verifyRuntimeFile } from './backlog/runtime.mjs';
 
-const VERSION = '0.7.1';
+const VERSION = '0.7.2';
 
 const USAGE = `Usage:
   miku-backlog-archive init --output <directory> --source-domain <domain> --project-key <key>
@@ -145,13 +146,15 @@ export function parseCommand(argv) {
 /**
  * @param {string[]} argv
  * @param {{ stdout?: { write(value: string): unknown }, stderr?: { write(value: string): unknown } }} [io]
+ * @param {{ collectArchive?: typeof collectArchive }} [dependencies]
  */
-export async function main(argv, io = {}) {
+export async function main(argv, io = {}, dependencies = {}) {
   const stdout = io.stdout ?? process.stdout;
   const stderr = io.stderr ?? process.stderr;
+  let command;
 
   try {
-    const command = parseCommand(argv);
+    command = parseCommand(argv);
     if (command.type === 'help') {
       stdout.write(USAGE);
       return 0;
@@ -180,7 +183,8 @@ export async function main(argv, io = {}) {
       return 0;
     }
     if (command.type === 'collect') {
-      const result = await collectArchive({
+      const collect = dependencies.collectArchive ?? collectArchive;
+      const result = await collect({
         output: command.output,
         runtimePath: command.runtimePath,
         onProgress(event) {
@@ -225,6 +229,21 @@ export async function main(argv, io = {}) {
     );
     return 0;
   } catch (error) {
+    if (command?.type === 'collect') {
+      const safeEnvironmentErrors = new Set([
+        'BACKLOG_API_KEY must be provided at runtime.',
+        'BACKLOG_DOMAIN does not match the archive manifest.',
+      ]);
+      const hasDiagnostics = error && typeof error === 'object'
+        && error.collectionDiagnostics && typeof error.collectionDiagnostics === 'object';
+      const message = hasDiagnostics
+        ? formatCollectionError(error)
+        : error instanceof Error && safeEnvironmentErrors.has(error.message)
+          ? error.message
+          : 'Collection failed before a request completed. Check the Runtime file, archive, and runtime configuration.';
+      stderr.write(`miku-backlog-archive: ${message}\n`);
+      return 1;
+    }
     const message = error instanceof Error ? error.message : String(error);
     stderr.write(`miku-backlog-archive: ${message}\n`);
     return 1;

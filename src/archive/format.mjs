@@ -77,7 +77,7 @@ export function createInitialManifest(input) {
     archive: {
       id: randomUUID(),
       createdAt: now.toISOString(),
-      toolVersion: input.toolVersion ?? '0.7.1',
+      toolVersion: input.toolVersion ?? '0.7.2',
     },
     source: {
       domain: normalizeBacklogDomain(input.domain),

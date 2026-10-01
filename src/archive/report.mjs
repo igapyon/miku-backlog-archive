@@ -1,16 +1,13 @@
 import { join } from 'node:path';
 
 import { writeFileAtomically } from './atomic-write.mjs';
+import { normalizeFailure, safeTaskLabel } from './diagnostics.mjs';
 import { verifyArchive } from './session.mjs';
 import { formatJstTimestamp } from './time.mjs';
 import { writeUiAssets } from '../ui/assets.mjs';
 import { existingArchiveNavigation, renderPage } from '../ui/page.mjs';
 
 const REPORT_PATH = 'collection-status.html';
-const SAFE_TARGET_KEYS = new Set([
-  'projectId', 'projectKey', 'issueId', 'issueKey', 'wikiId', 'attachmentId',
-  'sharedFileId', 'offset', 'minId',
-]);
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -29,24 +26,8 @@ function record(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
-function safeTarget(value) {
-  const target = record(value);
-  const result = {};
-  for (const [key, item] of Object.entries(target)) {
-    if (!SAFE_TARGET_KEYS.has(key)) {
-      continue;
-    }
-    if (typeof item === 'string' || typeof item === 'number') {
-      result[key] = item;
-    } else if (Array.isArray(item) && item.every((entry) => typeof entry === 'number')) {
-      result[key] = item;
-    }
-  }
-  return result;
-}
-
 function renderTarget(value) {
-  const target = safeTarget(value);
+  const target = record(value);
   return Object.keys(target).length === 0
     ? '<span class="muted">—</span>'
     : `<pre>${escapeHtml(JSON.stringify(target, null, 2))}</pre>`;
@@ -56,8 +37,12 @@ function failedTasks(progress) {
   const tasks = record(progress.tasks);
   return Object.entries(tasks)
     .filter(([, value]) => record(value).state === 'failed')
-    .sort(([left], [right]) => left.localeCompare(right))
-    .map(([key, value]) => ({ key, task: record(value), failure: record(record(value).failure) }));
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, value]) => ({
+      key: safeTaskLabel(key),
+      task: record(value),
+      failure: normalizeFailure(record(value).failure),
+    }));
 }
 
 function rateLimitWait(progress) {
@@ -103,10 +88,11 @@ export async function renderCollectionReport(input) {
         <td>${escapeHtml(display(failure.operation))}</td>
         <td>${renderTarget(failure.target)}</td>
         <td>${escapeHtml(display(failure.code))}</td>
-        <td>${escapeHtml(display(failure.httpStatus))}</td>
-        <td>${failure.retryable === true ? 'はい' : failure.retryable === false ? 'いいえ' : '—'}</td>
-        <td>${escapeHtml(display(failure.requestAttempts))}</td>
+        <td>${escapeHtml(display(failure.httpStatus, '未取得'))}</td>
+        <td>${failure.retryable === true ? 'はい' : failure.retryable === false ? 'いいえ' : '不明'}</td>
+        <td>${escapeHtml(display(failure.requestAttempts, '不明'))}</td>
         <td>${escapeHtml(formatJstTimestamp(failure.at))}</td>
+        <td>${escapeHtml(failure.hint)}</td>
       </tr>`).join('');
   await writeFileAtomically(reportPath, renderPage('収集状況', 0, `
     <p>このページは保存済みの manifest と進捗記録から生成します。Backlog へは接続しません。</p>
@@ -123,7 +109,7 @@ export async function renderCollectionReport(input) {
     ${failures.length === 0 ? '<p class="muted">再開が必要な失敗タスクはありません。</p>' : `
       <div class="table-scroll" role="region" aria-label="失敗タスク一覧" tabindex="0"><table>
         <caption>失敗タスク（${failures.length}件）</caption>
-        <thead><tr><th>タスク</th><th>操作</th><th>対象</th><th>コード</th><th>HTTP</th><th>再試行可</th><th>API 試行回数</th><th>記録時刻</th></tr></thead>
+        <thead><tr><th>タスク</th><th>操作</th><th>対象</th><th>コード</th><th>HTTP</th><th>再試行可</th><th>API 試行回数</th><th>記録時刻</th><th>確認先</th></tr></thead>
         <tbody>${rows}
         </tbody>
       </table></div>`}

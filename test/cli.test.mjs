@@ -4,6 +4,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { ArchiveCollectionError } from '../src/archive/collector.mjs';
 import { ArchiveFormatError } from '../src/archive/format.mjs';
 import { main, parseCommand } from '../src/cli.mjs';
 
@@ -116,4 +117,50 @@ test('initializes and verifies an archive through the CLI entry point', async (t
     0,
   );
   assert.match(reported.value, /Rendered collection report: status=initialized/);
+});
+
+test('prints structured collection failure details without raw Runtime messages', async () => {
+  const stdout = bufferedOutput();
+  const stderr = bufferedOutput();
+  const error = new ArchiveCollectionError('Backlog operation failed: get_project.', {
+    failedTaskCount: 1,
+    omittedFailureCount: 0,
+    failures: [{
+      task: 'project',
+      operation: 'get_project',
+      target: { projectKey: 'DEMO' },
+      code: 'UPSTREAM_ERROR',
+      requestAttempts: 3,
+    }],
+  });
+  error.runtimeMessage = 'runtime-api-key-never-print';
+
+  const status = await main(
+    ['collect', '--archive', 'archive', '--runtime', 'runtime.mjs'],
+    { stdout: stdout.output, stderr: stderr.output },
+    { async collectArchive() { throw error; } },
+  );
+
+  assert.equal(status, 1);
+  assert.equal(stdout.value, '');
+  assert.match(stderr.value, /failed tasks: 1/u);
+  assert.match(stderr.value, /task=project, operation=get_project/u);
+  assert.match(stderr.value, /HTTP=未取得, API試行回数=3/u);
+  assert.match(stderr.value, /report --archive <directory>/u);
+  assert.doesNotMatch(stderr.value, /runtime-api-key-never-print/u);
+});
+
+test('hides unstructured exception text from failed collection commands', async () => {
+  const stdout = bufferedOutput();
+  const stderr = bufferedOutput();
+  const status = await main(
+    ['collect', '--archive', 'archive', '--runtime', 'runtime.mjs'],
+    { stdout: stdout.output, stderr: stderr.output },
+    { async collectArchive() { throw new Error('https://example.test/?apiKey=never-print'); } },
+  );
+
+  assert.equal(status, 1);
+  assert.equal(stdout.value, '');
+  assert.match(stderr.value, /Check the Runtime file, archive, and runtime configuration/u);
+  assert.doesNotMatch(stderr.value, /example\.test|never-print/u);
 });

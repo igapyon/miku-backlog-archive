@@ -3,6 +3,7 @@ import { join } from 'node:path';
 
 import { verifyRuntimeFile, verifyRuntimeModule } from '../backlog/runtime.mjs';
 import { writeJsonAtomically, writeWebStreamAtomically } from './atomic-write.mjs';
+import { normalizeFailure, summarizeCurrentFailures } from './diagnostics.mjs';
 import { ArchiveFormatError, normalizeBacklogDomain } from './format.mjs';
 import {
   normalizeAttachment,
@@ -42,19 +43,21 @@ const REQUIRED_ISSUE_FIELDS = [
 ];
 
 export class ArchiveCollectionError extends Error {
-  constructor(message) {
+  constructor(message, collectionDiagnostics = undefined) {
     super(message);
     this.name = 'ArchiveCollectionError';
+    this.collectionDiagnostics = collectionDiagnostics;
   }
 }
 
 class OperationFailure extends ArchiveCollectionError {
   constructor(operation, target, code, httpStatus) {
     super(`Backlog operation failed: ${operation}.`);
-    this.operation = operation;
-    this.target = target;
-    this.code = code;
-    this.httpStatus = httpStatus;
+    const diagnostic = normalizeFailure({ operation, target, code, httpStatus });
+    this.operation = diagnostic.operation;
+    this.target = diagnostic.target;
+    this.code = diagnostic.code;
+    this.httpStatus = diagnostic.httpStatus;
   }
 }
 
@@ -84,10 +87,13 @@ async function retryRequest(runtime, operation, request) {
     try {
       return await request();
     } catch (error) {
-      if (!(error instanceof OperationFailure) || !isRetryable(error.httpStatus, error.code)) {
+      if (!(error instanceof OperationFailure)) {
         throw error;
       }
       error.requestAttempts = attempt;
+      if (!isRetryable(error.httpStatus, error.code)) {
+        throw error;
+      }
       if (error.httpStatus === 429 && attempt === MAX_REQUEST_ATTEMPTS) {
         throw new RateLimitExhaustedError(error);
       }
@@ -167,8 +173,7 @@ async function completeTask(paths, progress, key, now, details = {}) {
 
 async function failTask(paths, progress, key, error, now) {
   const previous = task(progress, key) ?? {};
-  const failure = {
-    task: key,
+  const failure = normalizeFailure({
     operation: error instanceof OperationFailure ? error.operation : 'local',
     target: error instanceof OperationFailure ? error.target : {},
     code: error instanceof OperationFailure ? error.code : 'LOCAL_ERROR',
@@ -181,8 +186,11 @@ async function failTask(paths, progress, key, error, now) {
     retryable: error instanceof OperationFailure
       ? isRetryable(error.httpStatus, error.code)
       : false,
-    at: nowIso(now),
-  };
+  });
+  // Preserve the collector-generated task key in history. CLI/report labels
+  // are separately sanitized before display.
+  failure.task = key;
+  failure.at = nowIso(now);
   progress.tasks[key] = {
     ...previous,
     state: 'failed',
@@ -1216,6 +1224,14 @@ function hasFailedTasks(progress) {
   return Object.values(progress.tasks ?? {}).some((value) => value?.state === 'failed');
 }
 
+function attachCollectionDiagnostics(error, progress) {
+  const collectionError = error instanceof ArchiveCollectionError
+    ? error
+    : new ArchiveCollectionError('Collection failed due to an unexpected local error.');
+  collectionError.collectionDiagnostics = summarizeCurrentFailures(progress);
+  return collectionError;
+}
+
 /**
  * Collect one archive's project and issue data. The caller supplies either a
  * verified Runtime file or a Runtime object for tests; no direct Backlog HTTP
@@ -1384,7 +1400,7 @@ export async function collectArchive(input) {
     updateTimestamp(progress, now);
     await saveManifest(paths, manifest);
     await saveProgress(paths, progress);
-    throw error;
+    throw attachCollectionDiagnostics(error, progress);
   }
 
   if (hasFailedTasks(progress)) {
@@ -1393,7 +1409,10 @@ export async function collectArchive(input) {
     updateTimestamp(progress, now);
     await saveManifest(paths, manifest);
     await saveProgress(paths, progress);
-    throw new ArchiveCollectionError('Collection is incomplete; retry failed tasks to resume.');
+    throw attachCollectionDiagnostics(
+      new ArchiveCollectionError('Collection is incomplete; retry failed tasks to resume.'),
+      progress,
+    );
   }
 
   manifest.collection.status = 'completed';
