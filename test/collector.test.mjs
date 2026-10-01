@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { collectArchive as collectArchiveOperation } from '../src/archive/collector.mjs';
+import { normalizeWikiSummary } from '../src/archive/normalize.mjs';
 import { initializeArchive } from '../src/archive/session.mjs';
 
 const operationNames = [
@@ -15,6 +16,32 @@ const operationNames = [
   'download_issue_attachment', 'download_wiki_attachment', 'download_shared_file',
 ];
 const immediateWait = async () => {};
+
+test('normalizes Backlog Wiki tag objects and keeps legacy string tags', () => {
+  const summary = normalizeWikiSummary({
+    id: 301,
+    projectId: 8,
+    name: 'Overview',
+    tags: [
+      { id: 12, name: '議事録', extra: 'discarded' },
+      'legacy',
+      { id: 0, name: 'invalid id' },
+      { id: 14, name: '  ' },
+      null,
+      15,
+      '',
+    ],
+  });
+  assert.deepEqual(summary.tags, [
+    { id: 12, name: '議事録' },
+    'legacy',
+  ]);
+  assert.deepEqual(normalizeWikiSummary({
+    id: 302,
+    projectId: 8,
+    name: 'No tags',
+  }).tags, []);
+});
 
 function collectArchive(input) {
   return collectArchiveOperation({ wait: immediateWait, ...input });
@@ -78,16 +105,67 @@ function fixtureRuntime(responses, calls, downloads = async (operation) => {
         });
         return { success: false, diagnostics: [{ code: download.code ?? 'UPSTREAM_ERROR' }] };
       }
-      options.onAccess?.({
-        phase: 'success',
-        operation,
-        ...(download.rateLimit === undefined ? {} : { rateLimit: download.rateLimit }),
+      const source = download.body.getReader();
+      let accessSettled = false;
+      let resolveCompleted;
+      let rejectCompleted;
+      const completed = new Promise((resolve, reject) => {
+        resolveCompleted = resolve;
+        rejectCompleted = reject;
+      });
+      void completed.catch(() => {});
+      const succeed = () => {
+        if (accessSettled) return;
+        accessSettled = true;
+        options.onAccess?.({
+          phase: 'success',
+          operation,
+          ...(download.rateLimit === undefined ? {} : { rateLimit: download.rateLimit }),
+        });
+        resolveCompleted();
+      };
+      const fail = (error) => {
+        if (accessSettled) return;
+        accessSettled = true;
+        options.onAccess?.({
+          phase: 'failure',
+          operation,
+          ...(download.httpStatus === undefined ? {} : { httpStatus: download.httpStatus }),
+          ...(download.rateLimit === undefined ? {} : { rateLimit: download.rateLimit }),
+        });
+        rejectCompleted(error);
+      };
+      const body = new ReadableStream({
+        async pull(controller) {
+          try {
+            const chunk = await source.read();
+            if (chunk.done) {
+              try {
+                await (download.completed ?? Promise.resolve());
+                succeed();
+                controller.close();
+              } catch (error) {
+                fail(error);
+                controller.error(error);
+              }
+              return;
+            }
+            controller.enqueue(chunk.value);
+          } catch (error) {
+            fail(error);
+            controller.error(error);
+          }
+        },
+        async cancel(reason) {
+          await source.cancel(reason).catch(() => {});
+          fail(reason instanceof Error ? reason : new Error('Download transfer cancelled.'));
+        },
       });
       return {
         success: true,
         transfer: {
-          body: download.body,
-          completed: download.completed ?? Promise.resolve(),
+          body,
+          completed,
         },
       };
     },
@@ -755,6 +833,20 @@ function readableText(value) {
   });
 }
 
+function readableChunks(values) {
+  let index = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (index >= values.length) {
+        controller.close();
+      } else {
+        controller.enqueue(new TextEncoder().encode(values[index]));
+        index += 1;
+      }
+    },
+  });
+}
+
 test('collects current Wiki pages, recursive shared files, and safe streamed assets', async (t) => {
   const output = await temporaryArchive(t);
   const calls = [];
@@ -777,7 +869,7 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
       id: 301,
       projectId: 8,
       name: 'Overview',
-      tags: ['guide'],
+      tags: [{ id: 12, name: 'guide' }, { id: 13, name: '安全 & <確認>' }],
       createdUser: { id: 1, userId: 'owner', name: 'Owner', mailAddress: 'owner@example.test' },
       created: '2026-09-07T00:00:00Z',
       updatedUser: { id: 2, userId: 'editor', name: 'Editor', mailAddress: 'editor@example.test' },
@@ -788,6 +880,7 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
       projectId: 8,
       name: 'Overview',
       content: 'Current Wiki body',
+      tags: [{ id: 12, name: '議事録' }, { id: 13, name: '安全 & <確認>' }],
       attachments: [{
         id: 401,
         name: '../diagram?.png',
@@ -842,6 +935,15 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
 
   const savedWiki = JSON.parse(await readFile(join(output, 'data', 'wikis', '301.json'), 'utf8'));
   assert.equal(savedWiki.wiki.createdUser, null);
+  assert.deepEqual(savedWiki.wiki.tags, [
+    { id: 12, name: '議事録' },
+    { id: 13, name: '安全 & <確認>' },
+  ]);
+  const savedWikiIndex = JSON.parse(await readFile(join(output, 'data', 'wikis', 'index.json'), 'utf8'));
+  assert.deepEqual(savedWikiIndex.wikis[0].tags, [
+    { id: 12, name: 'guide' },
+    { id: 13, name: '安全 & <確認>' },
+  ]);
   assert.equal(JSON.stringify(savedWiki).includes('owner@example.test'), false);
 
   const sharedIndex = JSON.parse(await readFile(join(output, 'data', 'files', 'index.json'), 'utf8'));
@@ -881,6 +983,106 @@ test('collects current Wiki pages, recursive shared files, and safe streamed ass
   assert.equal(resumed.collectedWikiCount, 0);
   assert.equal(resumed.collectedAssetCount, 0);
   assert.deepEqual(calls, []);
+});
+
+test('applies download quota events after stream completion and failure', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  let clock = Date.parse('2026-09-07T00:00:00.000Z');
+  let firstResetAt;
+  let finalResetAt;
+  let interruptSecondDownload = true;
+  const downloadStarts = [];
+  const runtime = fixtureRuntime(async (operation, input) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues' || operation === 'get_wiki_pages') return [];
+    if (operation === 'get_shared_files' && input.path === './') return [601, 602, 603].map((id) => ({
+      id,
+      projectId: 8,
+      type: 'file',
+      dir: '/',
+      name: `quota-${id}.txt`,
+      size: 1,
+    }));
+    if (operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls, async (operation, input) => {
+    assert.equal(operation, 'download_shared_file');
+    downloadStarts.push({ id: input.sharedFileId, at: clock });
+    if (input.sharedFileId === 601) {
+      firstResetAt = clock + 30_000;
+      return {
+        body: readableChunks(['a', 'b', 'c']),
+        rateLimit: { limit: 60, remaining: 0, resetAt: new Date(firstResetAt).toISOString() },
+      };
+    }
+    if (input.sharedFileId === 602) {
+      if (!interruptSecondDownload) {
+        return { body: readableChunks(['retried']) };
+      }
+      let sent = false;
+      const body = new ReadableStream({
+        pull(controller) {
+          if (!sent) {
+            sent = true;
+            controller.enqueue(new TextEncoder().encode('partial'));
+          } else {
+            controller.error(new Error('stream interrupted'));
+          }
+        },
+      });
+      return {
+        body,
+        rateLimit: {
+          limit: 60,
+          remaining: 20,
+          resetAt: new Date(clock + 60_000).toISOString(),
+        },
+      };
+    }
+    finalResetAt = clock + 20_000;
+    return {
+      body: readableChunks(['done']),
+      rateLimit: { limit: 60, remaining: 1, resetAt: new Date(finalResetAt).toISOString() },
+    };
+  });
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => new Date(clock),
+    wait: async (milliseconds) => { clock += milliseconds; },
+  }), /Collection is incomplete/);
+
+  assert.equal(downloadStarts.length, 3);
+  assert.equal(downloadStarts[1].at, firstResetAt + 1_000);
+  assert.ok(downloadStarts[2].at - downloadStarts[1].at >= Math.ceil(60_000 / 19));
+  const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+  assert.equal(progress.tasks['shared-file:601'].state, 'completed');
+  assert.equal(progress.tasks['shared-file:602'].state, 'failed');
+  assert.equal(progress.tasks['shared-file:603'].state, 'completed');
+  assert.equal(progress.rateLimit.read.remaining, 1);
+  assert.equal(progress.rateLimit.read.blockedUntil, new Date(finalResetAt + 1_000).toISOString());
+  assert.deepEqual(
+    await readFile(join(output, 'assets', 'shared', '601-quota-601.txt'), 'utf8'),
+    'abc',
+  );
+
+  interruptSecondDownload = false;
+  const resumed = await collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    now: () => new Date(clock),
+    wait: async (milliseconds) => { clock += milliseconds; },
+  });
+  assert.equal(resumed.sharedFileCount, 3);
+  assert.equal(downloadStarts.length, 4);
+  assert.equal(downloadStarts[3].id, 602);
+  assert.equal(downloadStarts[3].at, finalResetAt + 1_000);
+  const resumedProgress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+  assert.equal(resumedProgress.tasks['shared-file:602'].state, 'completed');
 });
 
 test('records a failed asset download and resumes only that download', async (t) => {

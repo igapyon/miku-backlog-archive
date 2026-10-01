@@ -11,7 +11,7 @@ import { initializeArchive, verifyArchive } from './archive/session.mjs';
 import { formatJstTimestamp } from './archive/time.mjs';
 import { verifyRuntimeFile } from './backlog/runtime.mjs';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.1';
 
 const USAGE = `Usage:
   miku-backlog-archive init --output <directory> --source-domain <domain> --project-key <key>

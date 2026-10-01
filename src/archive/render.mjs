@@ -5,6 +5,9 @@ import { writeFileAtomically } from './atomic-write.mjs';
 import { ArchiveFormatError } from './format.mjs';
 import { verifyArchive } from './session.mjs';
 import { formatJstTimestamp } from './time.mjs';
+import { renderCollectionReport } from './report.mjs';
+import { writeUiAssets } from '../ui/assets.mjs';
+import { escapeHtml as importedEscapeHtml, renderPage } from '../ui/page.mjs';
 
 const PROJECT_SCHEMA = 'miku-backlog-archive/project/v1';
 const ISSUE_INDEX_SCHEMA = 'miku-backlog-archive/issue-index/v1';
@@ -13,6 +16,11 @@ const WIKI_INDEX_SCHEMA = 'miku-backlog-archive/wiki-index/v1';
 const WIKI_SCHEMA = 'miku-backlog-archive/wiki/v1';
 const SHARED_FILE_INDEX_SCHEMA = 'miku-backlog-archive/shared-file-index/v1';
 const ASSET_INDEX_SCHEMA = 'miku-backlog-archive/asset-index/v1';
+const EXTERNAL_IMAGE_PATTERN = /!\[[^\]\r\n]*\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)/uy;
+const MARKDOWN_LINK_PATTERN = /(?<!!)\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)/uy;
+const ATTACHMENT_PATTERN = /#(image|thumbnail)\(([^()\r\n]+)\)|#attach\(([^():\r\n]+)(?::(\d+))?\)|!\[([^\]\r\n]*)\]\[([^\]\r\n]+)\]/uy;
+const URL_PATTERN = /(https?:\/\/[^\s<>"']+|mailto:[^\s<>"']+|\/downloadSharedFile\/[^\s<>"']+)/uy;
+const BRACKETED_URL_PATTERN = /^(?:https?:\/\/|mailto:|\/downloadSharedFile\/)[^\s<>"']+$/u;
 
 export class ArchiveRenderError extends Error {
   constructor(message) {
@@ -21,40 +29,8 @@ export class ArchiveRenderError extends Error {
   }
 }
 
-const STYLE = `:root {
-  color-scheme: light dark;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  line-height: 1.55;
-}
-body { margin: 0; background: Canvas; color: CanvasText; }
-header, main { max-width: 72rem; margin: auto; padding: 1rem 1.25rem; }
-header { border-bottom: 1px solid color-mix(in srgb, CanvasText 20%, transparent); }
-h1 { margin: 0; font-size: 1.45rem; }
-h2 { margin-top: 2rem; }
-nav { display: flex; flex-wrap: wrap; gap: .8rem; margin-top: .75rem; }
-a { color: LinkText; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); padding: .45rem .6rem; text-align: left; vertical-align: top; }
-th { background: color-mix(in srgb, CanvasText 8%, transparent); }
-.body { white-space: normal; overflow-wrap: anywhere; }
-.muted { color: color-mix(in srgb, CanvasText 65%, Canvas); }
-.meta { display: grid; grid-template-columns: max-content 1fr; gap: .35rem .8rem; }
-.meta dt { font-weight: 600; }
-.attachments { padding-left: 1.25rem; }
-.attachment-preview { display: block; max-width: min(100%, 48rem); max-height: 32rem; margin: .5rem 0 1rem; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); }
-.inline-image { display: block; max-width: min(100%, 48rem); max-height: 32rem; margin: .5rem 0; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); }
-.thumbnail { max-width: 12rem; max-height: 8rem; }
-pre { overflow: auto; padding: .75rem; background: color-mix(in srgb, CanvasText 7%, transparent); }
-blockquote { margin: 1rem 0; padding: .1rem 1rem; border-inline-start: .25rem solid color-mix(in srgb, CanvasText 35%, transparent); background: color-mix(in srgb, CanvasText 5%, transparent); }
-`;
-
 function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/gu, '&amp;')
-    .replace(/</gu, '&lt;')
-    .replace(/>/gu, '&gt;')
-    .replace(/"/gu, '&quot;')
-    .replace(/'/gu, '&#39;');
+  return importedEscapeHtml(value);
 }
 
 function display(value, fallback = '—') {
@@ -244,41 +220,141 @@ function renderAttachmentMacro(match, attachmentLinks) {
   return `<a href="${escapeHtml(reference.href)}">${escapeHtml(reference.name)}</a>`;
 }
 
-function renderInlineText(value, links, attachmentLinks) {
-  const pattern = /#(image|thumbnail)\(([^()\r\n]+)\)|#attach\(([^():\r\n]+)(?::(\d+))?\)|!\[([^\]\r\n]*)\]\[([^\]\r\n]+)\]/gu;
-  let result = '';
-  let position = 0;
-  for (const match of value.matchAll(pattern)) {
-    result += renderInternalReferences(value.slice(position, match.index), links);
-    result += renderAttachmentMacro(match, attachmentLinks) ?? escapeHtml(match[0]);
-    position = match.index + match[0].length;
+function renderWikiReference(pageName, reference, links) {
+  if (links?.issueKeys?.has(pageName)) {
+    return renderInternalReferences(reference, links);
   }
-  return `${result}${renderInternalReferences(value.slice(position), links)}`;
+  if (BRACKETED_URL_PATTERN.test(pageName)) {
+    const link = renderExternalLink(pageName, links);
+    return link ? `[[${link}]]` : escapeHtml(reference);
+  }
+  const wikiIds = links?.wikiNameIds?.get(pageName);
+  if (!Array.isArray(wikiIds) || wikiIds.length !== 1) {
+    return escapeHtml(reference);
+  }
+  const href = links.wikiIds?.get(wikiIds[0]);
+  return href
+    ? `<a href="${escapeHtml(href)}">${escapeHtml(pageName)}</a>`
+    : escapeHtml(reference);
+}
+
+function bracketLiteral(value, start, end) {
+  return { kind: 'literal', raw: value.slice(start, end), end };
+}
+
+function readBracketReference(value, start) {
+  const contentStart = start + 2;
+
+  if (value.startsWith('[[', contentStart)) {
+    let position = contentStart + 2;
+    while (position < value.length && value[position] !== '\r' && value[position] !== '\n') {
+      if (value.startsWith(']]', position)) {
+        return bracketLiteral(value, start, position + 2);
+      }
+      position += 1;
+    }
+    let end = start;
+    while (value[end] === '[') end += 1;
+    return bracketLiteral(value, start, end);
+  }
+
+  let hasInnerBracket = false;
+  let position = contentStart;
+  while (position < value.length && value[position] !== '\r' && value[position] !== '\n') {
+    if (value.startsWith(']]', position)) {
+      const name = value.slice(contentStart, position);
+      if (name === '' || hasInnerBracket) {
+        return bracketLiteral(value, start, position + 2);
+      }
+      const end = position + 2;
+      return {
+        kind: 'reference',
+        raw: value.slice(start, end),
+        name,
+        end,
+      };
+    }
+    if (value.startsWith('[[', position)) {
+      return bracketLiteral(value, start, contentStart);
+    }
+    if (value[position] === '[' || value[position] === ']') {
+      hasInnerBracket = true;
+    }
+    position += 1;
+  }
+  return bracketLiteral(value, start, contentStart);
+}
+
+function matchAt(pattern, value, position) {
+  pattern.lastIndex = position;
+  return pattern.exec(value);
+}
+
+function readInlineTokenAt(value, position, links, attachmentLinks) {
+  if (value.startsWith('[[', position)) {
+    const bracket = readBracketReference(value, position);
+    const html = bracket.kind === 'reference'
+      ? renderWikiReference(bracket.name, bracket.raw, links)
+      : escapeHtml(bracket.raw);
+    return { html, end: bracket.end };
+  }
+
+  const externalImage = matchAt(EXTERNAL_IMAGE_PATTERN, value, position);
+  if (externalImage) {
+    return {
+      html: renderExternalLink(externalImage[1], links) ?? escapeHtml(externalImage[0]),
+      end: position + externalImage[0].length,
+    };
+  }
+
+  const markdownLink = matchAt(MARKDOWN_LINK_PATTERN, value, position);
+  if (markdownLink) {
+    return {
+      html: renderExternalLink(markdownLink[2], links, true, markdownLink[1])
+        ?? escapeHtml(markdownLink[0]),
+      end: position + markdownLink[0].length,
+    };
+  }
+
+  const attachment = matchAt(ATTACHMENT_PATTERN, value, position);
+  if (attachment) {
+    return {
+      html: renderAttachmentMacro(attachment, attachmentLinks) ?? escapeHtml(attachment[0]),
+      end: position + attachment[0].length,
+    };
+  }
+
+  const url = matchAt(URL_PATTERN, value, position);
+  if (!url) {
+    return null;
+  }
+  const { url: valueWithoutPunctuation, suffix } = splitTrailingUrlPunctuation(url[0]);
+  const link = renderExternalLink(valueWithoutPunctuation, links) ?? escapeHtml(valueWithoutPunctuation);
+  return {
+    html: `${link}${escapeHtml(suffix)}`,
+    end: position + url[0].length,
+  };
 }
 
 function renderText(value, links, attachmentLinks) {
   if (typeof value !== 'string' || value === '') {
     return '<span class="muted">—</span>';
   }
-  const pattern = /!\[[^\]\r\n]*\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)|(?<!!)\[([^\]\r\n]+)\]\((https?:\/\/[^\s<>"')]+|mailto:[^\s<>"')]+|\/downloadSharedFile\/[^\s<>"')]+)\)|(https?:\/\/[^\s<>"']+|mailto:[^\s<>"']+|\/downloadSharedFile\/[^\s<>"']+)/gu;
   let result = '';
   let position = 0;
-  for (const match of value.matchAll(pattern)) {
-    result += renderInlineText(value.slice(position, match.index), links, attachmentLinks);
-    if (match[1] !== undefined) {
-      const externalImage = renderExternalLink(match[1], links);
-      result += externalImage ?? escapeHtml(match[0]);
-    } else if (match[3] !== undefined) {
-      const markdownLink = renderExternalLink(match[3], links, true, match[2]);
-      result += markdownLink ?? escapeHtml(match[0]);
-    } else {
-      const { url, suffix } = splitTrailingUrlPunctuation(match[4]);
-      result += renderExternalLink(url, links) ?? escapeHtml(url);
-      result += escapeHtml(suffix);
+  let plainStart = 0;
+  while (position < value.length) {
+    const token = readInlineTokenAt(value, position, links, attachmentLinks);
+    if (!token) {
+      position += 1;
+      continue;
     }
-    position = match.index + match[0].length;
+    result += renderInternalReferences(value.slice(plainStart, position), links);
+    result += token.html;
+    position = token.end;
+    plainStart = position;
   }
-  return `${result}${renderInlineText(value.slice(position), links, attachmentLinks)}`;
+  return `${result}${renderInternalReferences(value.slice(plainStart), links)}`;
 }
 
 function blockType(line) {
@@ -355,30 +431,8 @@ function renderBody(value, links, attachmentLinks) {
   return blocks.join('\n');
 }
 
-function page(title, depth, body) {
-  const prefix = depth === 0 ? '' : '../'.repeat(depth);
-  return `<!doctype html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(title)} | miku-backlog-archive</title>
-  <link rel="stylesheet" href="${prefix}assets/style.css">
-</head>
-<body>
-  <header>
-    <h1>${escapeHtml(title)}</h1>
-    <nav aria-label="アーカイブ内メニュー">
-      <a href="${prefix}index.html">ホーム</a>
-      <a href="${prefix}issues/index.html">課題</a>
-      <a href="${prefix}wikis/index.html">Wiki</a>
-      <a href="${prefix}files/index.html">ファイル</a>
-    </nav>
-  </header>
-  <main>${body}</main>
-</body>
-</html>
-`;
+function page(title, depth, body, options = {}) {
+  return renderPage(title, depth, body, options);
 }
 
 async function readJson(path, label) {
@@ -420,7 +474,8 @@ function assetHref(asset, depth) {
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
     return null;
   }
-  return `${'../'.repeat(depth + 1)}${asset.localPath}`;
+  const encodedPath = segments.map((segment) => encodeURIComponent(segment)).join('/');
+  return `${'../'.repeat(depth + 1)}${encodedPath}`;
 }
 
 function isPreviewableImage(name) {
@@ -514,6 +569,7 @@ function issuePage(
   textLinks,
   issueLinksById,
   childIssues,
+  pageContext,
 ) {
   const issue = issueData.issue;
   const comments = requireArray(issueData.comments, 'issue comments');
@@ -576,10 +632,10 @@ function issuePage(
         <div class="body">${renderBody(comment.content, bodyLinks, attachmentLinks)}</div>
         ${comment.changeLog === null || comment.changeLog === undefined ? '' : `<details><summary>変更記録</summary>${renderJson(comment.changeLog)}</details>`}
       </section>`).join('')}
-  `);
+  `, { ...pageContext, activeSection: 'issues', currentIsPage: false });
 }
 
-function wikiPage(wikiData, wikiAssets, sharedAssetsByFileId, textLinks) {
+function wikiPage(wikiData, wikiAssets, sharedAssetsByFileId, textLinks, pageContext) {
   const wiki = wikiData.wiki;
   const wikiId = requirePositiveId(wiki.id, 'wiki');
   const attachments = requireArray(wiki.attachments, 'wiki attachments');
@@ -596,7 +652,7 @@ function wikiPage(wikiData, wikiAssets, sharedAssetsByFileId, textLinks) {
     ${attachmentList(attachments, wikiAssets, 1)}
     <h2>共有ファイル</h2>
     ${sharedFileList(requireArray(wiki.sharedFiles, 'wiki shared files'), sharedAssetsByFileId, 1)}
-  `);
+  `, { ...pageContext, activeSection: 'wikis', currentIsPage: false });
 }
 
 function sharedDirectoryId(path) {
@@ -634,16 +690,17 @@ function renderSharedDirectoryTree(directories, files, assetsByFileId) {
       nodes.get('/').files.push(file);
     }
   }
-  const renderNode = (node) => {
+  const renderNode = (node, headingLevel = 2) => {
     const path = node.directory.path;
     const children = [...node.children].sort((left, right) => left.directory.path.localeCompare(right.directory.path));
     const filesInDirectory = [...node.files].sort((left, right) => String(left.path).localeCompare(String(right.path)));
     return `<section id="${escapeHtml(sharedDirectoryId(path))}">
-      <h2>${escapeHtml(path)}</h2>
+      <h${headingLevel}>${escapeHtml(path)}</h${headingLevel}>
       ${children.length === 0 && filesInDirectory.length === 0 ? '<p class="muted">このフォルダは空です。</p>' : ''}
       ${children.length === 0 ? '' : `<h3>フォルダ</h3><ul>${children.map((child) => `<li><a href="#${escapeHtml(sharedDirectoryId(child.directory.path))}">${escapeHtml(display(child.directory.name, child.directory.path))}</a></li>`).join('')}</ul>`}
       ${filesInDirectory.length === 0 ? '' : `<h3>ファイル</h3><ul class="attachments">${filesInDirectory.map((file) => renderSharedFileEntry(file, assetsByFileId)).join('')}</ul>`}
-    </section>${children.map(renderNode).join('')}`;
+      ${children.map((child) => renderNode(child, Math.min(headingLevel + 1, 6))).join('')}
+    </section>`;
   };
   return renderNode(nodes.get('/'));
 }
@@ -710,7 +767,23 @@ export async function renderArchive(input) {
     wikis.push(data);
   }
 
-  await writeFileAtomically(join(paths.site, 'assets', 'style.css'), STYLE);
+  const wikiNameIds = new Map();
+  for (const { wiki } of wikis) {
+    if (typeof wiki.name !== 'string' || wiki.name === '') {
+      continue;
+    }
+    const ids = wikiNameIds.get(wiki.name) ?? [];
+    if (!ids.includes(wiki.id)) {
+      ids.push(wiki.id);
+    }
+    wikiNameIds.set(wiki.name, ids);
+  }
+
+  await writeUiAssets(paths.site);
+  const pageContext = {
+    projectName: display(projectData.project.name, 'Backlog アーカイブ'),
+    completedAt: manifest.collection?.completedAt,
+  };
   const issueIds = new Set(issues.map(({ issue }) => issue.id));
   const commentIdsByIssueKey = new Map(
     issues.map(({ issue, comments }) => [issue.issueKey, new Set(comments.map((comment) => comment.id))]),
@@ -720,6 +793,7 @@ export async function renderArchive(input) {
     projectKey: projectData.project.projectKey,
     issueKeys: new Map(issues.map(({ issue }) => [issue.issueKey, issueHref(issue)])),
     wikiIds: new Map(wikis.map(({ wiki }) => [wiki.id, wikiHref(wiki)])),
+    wikiNameIds,
     commentIdsByIssueKey,
     sharedFileAssetsById,
     assetDepth,
@@ -753,22 +827,25 @@ export async function renderArchive(input) {
   );
   await writeFileAtomically(join(paths.site, 'index.html'), page(projectData.project.name, 0, `
     <p>${renderText(projectData.project.description, textLinksFromHome)}</p>
+    <nav class="summary-cards" aria-label="保存内容へのリンク">
+      <a class="summary-card" href="issues/index.html"><span class="summary-card__value">${issues.length}</span><span class="summary-card__label">課題を見る</span></a>
+      <a class="summary-card" href="wikis/index.html"><span class="summary-card__value">${wikis.length}</span><span class="summary-card__label">Wiki を見る</span></a>
+      <a class="summary-card" href="files/index.html"><span class="summary-card__value">${sharedFiles.length}</span><span class="summary-card__label">共有ファイルを見る</span></a>
+    </nav>
+    <h2>アーカイブ情報</h2>
     <dl class="meta">
       <dt>プロジェクト</dt><dd>${escapeHtml(display(projectData.project.projectKey))}</dd>
       <dt>取得元</dt><dd>${escapeHtml(display(manifest.source?.domain))}</dd>
       <dt>取得開始</dt><dd>${escapeHtml(formatJstTimestamp(manifest.collection?.startedAt))}</dd>
       <dt>取得完了</dt><dd>${escapeHtml(formatJstTimestamp(manifest.collection?.completedAt))}</dd>
-      <dt>課題</dt><dd>${issues.length}</dd>
-      <dt>Wiki</dt><dd>${wikis.length}</dd>
-      <dt>共有ファイル</dt><dd>${sharedFiles.length}</dd>
       <dt>保存ファイル</dt><dd>${escapeHtml(display(manifest.collection?.counts?.assets, issueAssets.length + wikiAssets.length + sharedAssets.length))}</dd>
     </dl>
-  `));
+  `, { ...pageContext, activeSection: 'home' }));
   await writeFileAtomically(join(paths.site, 'issues', 'index.html'), page('課題', 1, `
-    <table><thead><tr><th>キー</th><th>件名</th><th>状態</th><th>担当者</th><th>更新</th></tr></thead><tbody>
+    <div class="table-scroll" role="region" aria-label="課題一覧" tabindex="0"><table><caption>課題一覧（${issues.length}件）</caption><thead><tr><th>キー</th><th>件名</th><th>状態</th><th>担当者</th><th>更新</th></tr></thead><tbody>
       ${issues.map(({ issue }) => `<tr><td><a href="${issue.id}.html">${escapeHtml(display(issue.issueKey))}</a></td><td>${escapeHtml(display(issue.summary))}</td><td>${escapeHtml(displayName(issue.status))}</td><td>${escapeHtml(personName(issue.assignee))}</td><td>${escapeHtml(formatJstTimestamp(issue.updated))}</td></tr>`).join('')}
-    </tbody></table>
-  `));
+    </tbody></table></div>
+  `, { ...pageContext, activeSection: 'issues' }));
   for (const issueData of issues) {
     const assets = issueAssets.filter((asset) => asset.issueId === issueData.issue.id);
     await writeFileAtomically(
@@ -781,25 +858,28 @@ export async function renderArchive(input) {
         textLinksFromIssue,
         issueLinksById,
         childIssues,
+        pageContext,
       ),
     );
   }
   await writeFileAtomically(join(paths.site, 'wikis', 'index.html'), page('Wiki', 1, `
-    <table><thead><tr><th>題名</th><th>タグ</th><th>更新</th></tr></thead><tbody>
+    <div class="table-scroll" role="region" aria-label="Wiki 一覧" tabindex="0"><table><caption>Wiki 一覧（${wikis.length}件）</caption><thead><tr><th>題名</th><th>タグ</th><th>更新</th></tr></thead><tbody>
       ${wikis.map(({ wiki }) => `<tr><td><a href="${wiki.id}.html">${escapeHtml(display(wiki.name))}</a></td><td>${escapeHtml(displayNames(wiki.tags))}</td><td>${escapeHtml(formatJstTimestamp(wiki.updated))}</td></tr>`).join('')}
-    </tbody></table>
-  `));
+    </tbody></table></div>
+  `, { ...pageContext, activeSection: 'wikis' }));
   for (const wikiData of wikis) {
     const assets = wikiAssets.filter((asset) => asset.wikiId === wikiData.wiki.id);
     await writeFileAtomically(
       join(paths.site, 'wikis', `${wikiData.wiki.id}.html`),
-      wikiPage(wikiData, assets, sharedAssetsByFileId, textLinksFromWiki),
+      wikiPage(wikiData, assets, sharedAssetsByFileId, textLinksFromWiki, pageContext),
     );
   }
   await writeFileAtomically(join(paths.site, 'files', 'index.html'), page('ファイル', 1, `
-    <p><a href="#${sharedDirectoryId('/')}">ルートフォルダへ</a></p>
+    <p><a class="button-link" href="#${sharedDirectoryId('/')}">ルートフォルダへ</a></p>
     ${renderSharedDirectoryTree(sharedDirectories, sharedFiles, sharedAssetsByFileId)}
-  `));
+  `, { ...pageContext, activeSection: 'files' }));
+
+  await renderCollectionReport({ output: paths.root });
 
   return { issueCount: issues.length, wikiCount: wikis.length, sharedFileCount: sharedFiles.length };
 }
