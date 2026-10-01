@@ -92,14 +92,47 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   assert.match(html, /進捗更新<\/dt><dd>2026-09-12 09:01:00 JST<\/dd>/);
   assert.match(html, /API待機<\/dt><dd>read枠、429の待機、2026-09-12 09:02:00 JST以降に再開<\/dd>/);
   assert.match(html, /issue:101/);
-  assert.match(html, /get_issue&lt;script&gt;/);
-  assert.doesNotMatch(html, /<script>/);
+  assert.match(html, /<td>unknown<\/td>/);
+  assert.doesNotMatch(html, /get_issue&lt;script&gt;|<script>|apiKey|Authorization/u);
   assert.match(html, /&quot;issueId&quot;: 101/);
   assert.doesNotMatch(html, /must-not-render/);
   assert.match(html, /API 試行回数<\/th>/);
   assert.match(html, /<td>3<\/td>/);
+  assert.match(html, /Backlogの利用枠が制限されています/u);
   assert.match(html, /<td>2026-09-12 09:01:00 JST<\/td>/);
   assert.doesNotMatch(html, /https?:\/\//);
+});
+
+test('does not show an arbitrary shared-directory path in failure report labels', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'miku-backlog-archive-report-test-'));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, 'archive');
+  const { paths } = await initializeArchive({
+    output,
+    domain: 'example.backlog.com',
+    projectKey: 'DEMO',
+    now: new Date('2026-09-12T00:00:00.000Z'),
+  });
+  const progress = JSON.parse(await readFile(paths.progress, 'utf8'));
+  progress.tasks = {
+    'shared-directory:%2Fcustomer-api-key-example': {
+      state: 'failed',
+      failure: {
+        operation: 'get_shared_files',
+        target: { projectId: 8, offset: 0 },
+        code: 'UPSTREAM_ERROR',
+      },
+    },
+  };
+  await writeJson(paths.progress, progress);
+
+  await renderCollectionReport({ output });
+  const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
+  assert.match(html, /<td>shared-directory<\/td>/);
+  assert.match(html, /<td>未取得<\/td>/);
+  assert.match(html, /<td>不明<\/td>\s*<td>不明<\/td>/u);
+  assert.doesNotMatch(html, /customer-api-key-example/u);
+  assert.match(html, /HTTP状態を取得できず、原因は未特定/u);
 });
 
 test('links a completed standalone report only to archive pages that exist', async (t) => {

@@ -78,12 +78,19 @@ function fixtureRuntime(responses, calls, downloads = async (operation) => {
       const response = await responses(operation, input);
       if (response.success === false) {
         options.onAccess?.({
+          ...(response.access && typeof response.access === 'object' ? response.access : {}),
           phase: 'failure',
           operation,
           httpStatus: response.httpStatus,
           ...(response.rateLimit === undefined ? {} : { rateLimit: response.rateLimit }),
         });
-        return { success: false, diagnostics: [{ code: response.code ?? 'UPSTREAM_ERROR' }] };
+        return {
+          success: false,
+          diagnostics: [{
+            ...(Array.isArray(response.diagnostics) ? response.diagnostics[0] : {}),
+            code: response.code ?? response.diagnostics?.[0]?.code ?? 'UPSTREAM_ERROR',
+          }],
+        };
       }
       options.onAccess?.({
         phase: 'success',
@@ -745,6 +752,8 @@ test('records a retryable failed issue task without discarding completed project
   assert.equal(progress.tasks['issue:101'].failure.httpStatus, 429);
   assert.equal(progress.tasks['issue:101'].failure.retryable, true);
   assert.equal(progress.tasks['issue:101'].failure.requestAttempts, 3);
+  assert.equal(progress.tasks['issue:101'].failure.task, 'issue:101');
+  assert.equal(progress.failures.at(-1).task, 'issue:101');
   assert.equal(calls.filter((call) => call.operation === 'get_issue_participants').length, 3);
 
   calls.length = 0;
@@ -761,6 +770,7 @@ test('records a retryable failed issue task without discarding completed project
   assert.equal(calls.some((call) => call.operation === 'get_issue'), false);
   const resumedProgress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
   assert.equal(resumedProgress.phase, 'completed');
+  assert.equal(resumedProgress.failures.at(-1).task, 'issue:101');
   assert.equal(resumedProgress.tasks['issue:101'].attempts, 2);
   assert.equal(resumedProgress.waiting, undefined);
 });
@@ -821,6 +831,117 @@ test('records a 404 as a single non-retryable task failure', async (t) => {
   const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
   assert.equal(progress.tasks['issue:101'].failure.httpStatus, 404);
   assert.equal(progress.tasks['issue:101'].failure.retryable, false);
+});
+
+test('summarizes safe operation diagnostics when a project request has no HTTP status', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const secret = 'runtime-api-key-never-save';
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') {
+      return {
+        success: false,
+        diagnostics: [{
+          code: 'UPSTREAM_ERROR',
+          message: `request failed with ${secret}`,
+          url: `https://example.backlog.com/?apiKey=${secret}`,
+          headers: { Authorization: secret },
+        }],
+        access: { url: `https://example.backlog.com/?apiKey=${secret}`, headers: { Authorization: secret } },
+      };
+    }
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    wait: immediateWait,
+  }), (error) => {
+    assert.equal(error.collectionDiagnostics.failedTaskCount, 1);
+    assert.equal(error.collectionDiagnostics.failures[0].operation, 'get_project');
+    assert.equal(error.collectionDiagnostics.failures[0].target.projectKey, 'DEMO');
+    assert.equal(error.collectionDiagnostics.failures[0].code, 'UPSTREAM_ERROR');
+    assert.equal(error.collectionDiagnostics.failures[0].httpStatus, undefined);
+    assert.equal(error.collectionDiagnostics.failures[0].requestAttempts, 3);
+    assert.match(error.collectionDiagnostics.failures[0].hint, /原因は未特定/u);
+    return true;
+  });
+
+  const progressText = await readFile(join(output, 'state', 'progress.json'), 'utf8');
+  assert.doesNotMatch(progressText, new RegExp(secret, 'u'));
+  assert.equal(calls.filter(({ operation }) => operation === 'get_project').length, 3);
+});
+
+test('preserves HTTP diagnostics on project failures including unclassified client errors', async (t) => {
+  for (const httpStatus of [400, 401, 403, 404, 503]) {
+    const output = await temporaryArchive(t);
+    const calls = [];
+    const runtime = fixtureRuntime(async (operation) => {
+      assert.equal(operation, 'get_project');
+      return { success: false, code: 'UPSTREAM_ERROR', httpStatus };
+    }, calls);
+    await assert.rejects(collectArchive({
+      output,
+      runtime,
+      env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+      wait: immediateWait,
+    }), (error) => {
+      assert.equal(error.collectionDiagnostics.failedTaskCount, 1);
+      const failure = error.collectionDiagnostics.failures[0];
+      assert.equal(failure.httpStatus, httpStatus);
+      assert.equal(failure.operation, 'get_project');
+      assert.equal(failure.requestAttempts, 3);
+      assert.doesNotMatch(failure.hint, /HTTP状態を取得できず/u);
+      return true;
+    });
+    const progress = JSON.parse(await readFile(join(output, 'state', 'progress.json'), 'utf8'));
+    assert.equal(progress.tasks.project.failure.httpStatus, httpStatus);
+    assert.equal(progress.failures.at(-1).task, 'project');
+    assert.equal(calls.length, 3);
+  }
+});
+
+test('summarizes multiple current issue failures without exposing task path or old failures', async (t) => {
+  const output = await temporaryArchive(t);
+  const calls = [];
+  const issueItems = Array.from({ length: 6 }, (_, index) => {
+    const id = 101 + index;
+    return { id, projectId: 8, issueKey: `DEMO-${id}`, summary: `Issue ${id}` };
+  });
+  const runtimeSecret = 'runtime-api-key-never-save';
+  const runtime = fixtureRuntime(async (operation) => {
+    if (operation === 'get_project') return project;
+    if (operation === 'get_issues') return issueItems;
+    if (operation === 'get_issue') {
+      return {
+        success: false,
+        code: 'NOT_FOUND',
+        httpStatus: 404,
+        diagnostics: [{ message: runtimeSecret }],
+      };
+    }
+    if (operation === 'get_wiki_pages' || operation === 'get_shared_files') return [];
+    throw new Error(`Unexpected operation ${operation}`);
+  }, calls);
+
+  await assert.rejects(collectArchive({
+    output,
+    runtime,
+    env: { BACKLOG_DOMAIN: 'example.backlog.com', BACKLOG_API_KEY: 'not-saved' },
+    wait: immediateWait,
+  }), (error) => {
+    assert.equal(error.collectionDiagnostics.failedTaskCount, 6);
+    assert.equal(error.collectionDiagnostics.failures.length, 5);
+    assert.equal(error.collectionDiagnostics.omittedFailureCount, 1);
+    assert.deepEqual(error.collectionDiagnostics.failures.map(({ task }) => task), [
+      'issue:101', 'issue:102', 'issue:103', 'issue:104', 'issue:105',
+    ]);
+    assert.ok(error.collectionDiagnostics.failures.every(({ httpStatus }) => httpStatus === 404));
+    assert.doesNotMatch(JSON.stringify(error.collectionDiagnostics), /runtime-api-key/u);
+    return true;
+  });
 });
 
 function readableText(value) {
