@@ -31,6 +31,10 @@ test('renders an older progress file without rate-limit fields', async (t) => {
   const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
   assert.match(html, /API待機<\/dt><dd>待機なし<\/dd>/);
   assert.doesNotMatch(html, /429の待機/);
+  assert.match(html, /<span class="app-header__brand">DEMO<\/span>/);
+  assert.doesNotMatch(html, /href="index\.html"/);
+  assert.match(html, /href="collection-status\.html" aria-current="page">収集状況<\/a>/);
+  assert.doesNotMatch(html, /href="issues\/index\.html"/);
 });
 
 test('renders an offline, sanitized report for an incomplete collection', async (t) => {
@@ -96,4 +100,33 @@ test('renders an offline, sanitized report for an incomplete collection', async 
   assert.match(html, /<td>3<\/td>/);
   assert.match(html, /<td>2026-09-12 09:01:00 JST<\/td>/);
   assert.doesNotMatch(html, /https?:\/\//);
+});
+
+test('links a completed standalone report only to archive pages that exist', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'miku-backlog-archive-report-test-'));
+  t.after(async () => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, 'archive');
+  const { paths } = await initializeArchive({
+    output,
+    domain: 'example.backlog.com',
+    projectKey: 'DEMO',
+    now: new Date('2026-09-12T00:00:00.000Z'),
+  });
+  const manifest = JSON.parse(await readFile(paths.manifest, 'utf8'));
+  manifest.collection.status = 'completed';
+  manifest.collection.completedAt = '2026-09-12T00:01:00.000Z';
+  await writeJson(paths.manifest, manifest);
+  const progress = JSON.parse(await readFile(paths.progress, 'utf8'));
+  progress.phase = 'completed';
+  await writeJson(paths.progress, progress);
+  await writeFile(join(paths.site, 'index.html'), 'home');
+
+  await renderCollectionReport({ output });
+  await renderCollectionReport({ output });
+
+  const html = await readFile(join(paths.site, 'collection-status.html'), 'utf8');
+  assert.match(html, /<a class="app-header__brand" href="index\.html">DEMO<\/a>/);
+  assert.match(html, /href="index\.html">ホーム<\/a>/);
+  assert.equal((html.match(/href="collection-status\.html" aria-current="page">収集状況<\/a>/g) ?? []).length, 1);
+  assert.doesNotMatch(html, /href="issues\/index\.html"|href="wikis\/index\.html"|href="files\/index\.html"/);
 });

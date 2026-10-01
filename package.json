@@ -1,6 +1,6 @@
 {
   "name": "miku-backlog-archive",
-  "version": "0.6.0",
+  "version": "0.7.1",
   "private": true,
   "description": "Create a local, static archive of one Backlog project.",
   "type": "module",
@@ -11,7 +11,7 @@
     "miku-backlog-archive": "src/cli.mjs"
   },
   "scripts": {
-    "check": "node --check src/cli.mjs && node --check src/archive/atomic-write.mjs && node --check src/archive/collector.mjs && node --check src/archive/format.mjs && node --check src/archive/normalize.mjs && node --check src/archive/rate-limit.mjs && node --check src/archive/report.mjs && node --check src/archive/render.mjs && node --check src/archive/session.mjs && node --check src/archive/time.mjs && node --check src/backlog/runtime.mjs",
+    "check": "node --check src/cli.mjs && node --check src/archive/atomic-write.mjs && node --check src/archive/collector.mjs && node --check src/archive/format.mjs && node --check src/archive/normalize.mjs && node --check src/archive/rate-limit.mjs && node --check src/archive/report.mjs && node --check src/archive/render.mjs && node --check src/archive/session.mjs && node --check src/archive/time.mjs && node --check src/backlog/runtime.mjs && node --check src/ui/assets.mjs && node --check src/ui/page.mjs",
     "test": "node --test test/archive-session.test.mjs test/cli.test.mjs test/collector.test.mjs test/rate-limit.test.mjs test/render.test.mjs test/report.test.mjs test/runtime.test.mjs"
   },
   "license": "Apache-2.0"

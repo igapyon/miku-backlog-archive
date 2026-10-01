@@ -3,29 +3,14 @@ import { join } from 'node:path';
 import { writeFileAtomically } from './atomic-write.mjs';
 import { verifyArchive } from './session.mjs';
 import { formatJstTimestamp } from './time.mjs';
+import { writeUiAssets } from '../ui/assets.mjs';
+import { existingArchiveNavigation, renderPage } from '../ui/page.mjs';
 
 const REPORT_PATH = 'collection-status.html';
 const SAFE_TARGET_KEYS = new Set([
   'projectId', 'projectKey', 'issueId', 'issueKey', 'wikiId', 'attachmentId',
   'sharedFileId', 'offset', 'minId',
 ]);
-
-const STYLE = `:root {
-  color-scheme: light dark;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  line-height: 1.55;
-}
-body { margin: 0; background: Canvas; color: CanvasText; }
-main { max-width: 72rem; margin: auto; padding: 1rem 1.25rem; }
-h1 { font-size: 1.45rem; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); padding: .45rem .6rem; text-align: left; vertical-align: top; }
-th { background: color-mix(in srgb, CanvasText 8%, transparent); }
-pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.meta { display: grid; grid-template-columns: max-content 1fr; gap: .35rem .8rem; }
-.meta dt { font-weight: 600; }
-.muted { color: color-mix(in srgb, CanvasText 65%, Canvas); }
-`;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -96,22 +81,6 @@ function rateLimitWait(progress) {
   return null;
 }
 
-function page(body) {
-  return `<!doctype html>
-<html lang="ja">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>収集状況 | miku-backlog-archive</title>
-  <style>${STYLE}</style>
-</head>
-<body>
-  <main>${body}</main>
-</body>
-</html>
-`;
-}
-
 /**
  * Generate a local, safe status report without contacting Backlog. Unlike the
  * archive renderer, this report is also available for incomplete collections.
@@ -123,6 +92,11 @@ export async function renderCollectionReport(input) {
   const failures = failedTasks(progress);
   const waitStatus = rateLimitWait(progress);
   const reportPath = join(paths.site, REPORT_PATH);
+  await writeUiAssets(paths.site);
+  const navigation = manifest.collection?.status === 'completed'
+    ? (await existingArchiveNavigation(paths.site)).filter((item) => item.id !== 'report')
+    : [];
+  navigation.push({ id: 'report', label: '収集状況', href: REPORT_PATH });
   const rows = failures.map(({ key, failure }) => `
       <tr>
         <td>${escapeHtml(key)}</td>
@@ -134,8 +108,7 @@ export async function renderCollectionReport(input) {
         <td>${escapeHtml(display(failure.requestAttempts))}</td>
         <td>${escapeHtml(formatJstTimestamp(failure.at))}</td>
       </tr>`).join('');
-  await writeFileAtomically(reportPath, page(`
-    <h1>収集状況</h1>
+  await writeFileAtomically(reportPath, renderPage('収集状況', 0, `
     <p>このページは保存済みの manifest と進捗記録から生成します。Backlog へは接続しません。</p>
     <dl class="meta">
       <dt>プロジェクト</dt><dd>${escapeHtml(display(manifest.source?.project?.key))}</dd>
@@ -148,12 +121,18 @@ export async function renderCollectionReport(input) {
     </dl>
     <h2>失敗タスク</h2>
     ${failures.length === 0 ? '<p class="muted">再開が必要な失敗タスクはありません。</p>' : `
-      <table>
+      <div class="table-scroll" role="region" aria-label="失敗タスク一覧" tabindex="0"><table>
+        <caption>失敗タスク（${failures.length}件）</caption>
         <thead><tr><th>タスク</th><th>操作</th><th>対象</th><th>コード</th><th>HTTP</th><th>再試行可</th><th>API 試行回数</th><th>記録時刻</th></tr></thead>
         <tbody>${rows}
         </tbody>
-      </table>`}
-  `));
+      </table></div>`}
+  `, {
+    projectName: manifest.source?.project?.name ?? manifest.source?.project?.key ?? 'Backlog アーカイブ',
+    completedAt: manifest.collection?.completedAt,
+    activeSection: 'report',
+    navigation,
+  }));
   return {
     path: reportPath,
     collectionStatus: manifest.collection?.status ?? null,

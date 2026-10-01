@@ -200,11 +200,22 @@ export function normalizeRelatedIssue(value) {
 /** @param {unknown} value */
 export function normalizeWikiSummary(value) {
   const source = record(value, 'wiki summary');
+  const tags = arrayValue(source.tags).flatMap((tag) => {
+    if (typeof tag === 'string') {
+      return tag.trim() === '' ? [] : [tag];
+    }
+    if (!tag || typeof tag !== 'object' || Array.isArray(tag)
+      || !Number.isSafeInteger(tag.id) || tag.id <= 0
+      || typeof tag.name !== 'string' || tag.name.trim() === '') {
+      return [];
+    }
+    return [{ id: tag.id, name: tag.name }];
+  });
   return {
     id: positiveInteger(source.id, 'wiki.id'),
     projectId: positiveInteger(source.projectId, 'wiki.projectId'),
     name: stringValue(source.name),
-    tags: arrayValue(source.tags).filter((tag) => typeof tag === 'string'),
+    tags,
     createdUser: normalizePerson(source.createdUser),
     created: stringValue(source.created),
     updatedUser: normalizePerson(source.updatedUser),

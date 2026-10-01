@@ -42,8 +42,8 @@
 - `data/issues/` には課題一覧と、課題本体・コメント・参加者・関連課題を、`data/wikis/` には現在版 Wiki の一覧と本体を置きます。
 - `data/files/index.json` は共有ファイルのディレクトリ構成とファイル情報を保持します。`data/assets/index.json` は各ダウンロード済みファイルの ID、元の名前、サイズ、`assets/` から始まるローカル相対パスを対応づけます。
 - `assets/` 内の名前は ID を先頭に付け、区切り文字、制御文字、危険な相対パス、OS で使えない文字を安全な名前へ置換します。表示用の元の名前は JSON 側に保持します。元の名前をローカルパスとして使用しません。
-- `site/` は `render` が、完了済みアーカイブの `data/` と `assets/` だけを使って生成します。ページを開いた時に Backlog や CDN へ自動接続しません。本文中の通常の外部リンクは、利用者がクリックした時だけ遷移します。現在の生成器は最小の HTML と CSS を出力し、許可した記法だけを安全に HTML 化します。保存済み添付への限定的な画像・添付参照、取得済み課題キー、見出し・リスト・引用・コードフェンスを対象とし、外部画像は自動読込しません。共有ファイルは `data/files/index.json` のフォルダ階層をページ内ツリーとして表示します。
-- `site/collection-status.html` は `report` が manifest と `state/progress.json` だけから生成する収集状況ページです。完了前のアーカイブでも生成でき、現在 `failed` のタスクの操作、許可済みの対象 ID、HTTP 状態、再試行可否、API 試行回数を表示します。過去の失敗履歴や許可外の進捗フィールドは表示しません。
+- `site/` は `render` が、完了済みアーカイブの `data/` と `assets/` だけを使って生成します。セマンティックな HTML と Material Design 3 を参照した CSS を出力し、共通 CSS のソースは `src/ui/tokens.css` と `src/ui/archive.css` です。`site/assets/style.css` は CLI 実行時にこの2ファイルから生成します。ページを開いた時に Backlog や CDN へ自動接続しません。本文中の通常の外部リンクは、利用者がクリックした時だけ遷移します。許可した記法だけを安全に HTML 化し、取得済みWikiの一意な題名に一致する `[[Wikiページ名]]` はホーム説明・課題説明・課題コメント・Wiki本文から相対HTMLリンクにします。保存済み添付への限定的な画像・添付参照、取得済み課題キー、見出し・リスト・引用・コードフェンスにも対応します。外部画像は自動読込しません。共有ファイルは `data/files/index.json` のフォルダ階層を入れ子のページ内ツリーとして表示します。
+- `site/collection-status.html` は `render` の最後に生成される完成済みアーカイブの収集状況ページです。単独の `report` は完了前でも実行でき、manifest と `state/progress.json` からレポートを生成・更新します。現在 `failed` のタスクの操作、許可済みの対象 ID、HTTP 状態、再試行可否、API 試行回数を表示します。過去の失敗履歴や許可外の進捗フィールドは表示しません。閲覧画面と共通の `site/assets/style.css` を使い、存在が確認できるページへのリンクだけをメニューに表示します。
 
 初期化時点では、プロジェクトキーは分かっていても数値 ID はまだ未解決です。そのため `source.project.id` は `null` です。収集の開始前に `miku-backlog-api` から解決した ID を記録し、再開時は domain と ID を照合します。
 
@@ -57,7 +57,7 @@
   "archive": {
     "id": "UUID",
     "createdAt": "2026-09-07T00:00:00.000Z",
-    "toolVersion": "0.6.0"
+    "toolVersion": "0.7.1"
   },
   "source": {
     "domain": "example.backlog.com",

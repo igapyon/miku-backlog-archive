@@ -287,6 +287,12 @@ async function openDownloadOnce(runtime, operation, input, env) {
     await control.scheduler.waitBefore(operation);
   }
   const accessEvents = [];
+  let recordedEventCount = 0;
+  async function flushAccessEvents() {
+    const pendingEvents = accessEvents.slice(recordedEventCount);
+    recordedEventCount = accessEvents.length;
+    await recordAccessEvents(runtime, operation, pendingEvents);
+  }
   let response;
   try {
     response = await runtime.openDownload(operation, input, {
@@ -298,7 +304,7 @@ async function openDownloadOnce(runtime, operation, input, env) {
     });
   } catch {
     const accessFailure = accessEvents.find((event) => event?.phase === 'failure');
-    await recordAccessEvents(runtime, operation, accessEvents);
+    await flushAccessEvents();
     throw new OperationFailure(
       operation,
       safeTarget(input),
@@ -307,7 +313,7 @@ async function openDownloadOnce(runtime, operation, input, env) {
     );
   }
 
-  await recordAccessEvents(runtime, operation, accessEvents);
+  await flushAccessEvents();
 
   if (!response || response.success !== true) {
     const diagnostic = response?.diagnostics?.[0];
@@ -325,7 +331,7 @@ async function openDownloadOnce(runtime, operation, input, env) {
     || !transfer.completed || typeof transfer.completed.then !== 'function') {
     throw new OperationFailure(operation, safeTarget(input), 'UPSTREAM_ERROR');
   }
-  return transfer;
+  return { transfer, flushAccessEvents };
 }
 
 async function openDownload(runtime, operation, input, env) {
@@ -774,16 +780,26 @@ async function collectAsset({
   }
 
   await beginTask(paths, progress, taskKey, now, { ...taskDetails, localPath });
+  let download;
   try {
-    const transfer = await openDownload(runtime, operation, input, env);
-    await Promise.all([
-      writeWebStreamAtomically(destination, transfer.body),
-      transfer.completed,
-    ]);
+    download = await openDownload(runtime, operation, input, env);
+    const writePromise = writeWebStreamAtomically(destination, download.transfer.body);
+    try {
+      await Promise.all([writePromise, download.transfer.completed]);
+    } catch (error) {
+      await download.transfer.body.cancel(error).catch(() => {});
+      await Promise.allSettled([writePromise, download.transfer.completed]);
+      throw error;
+    }
+    await download.flushAccessEvents();
     await recordAsset({ paths, assetIndex, kind, parentId, file, localPath, now });
     await completeTask(paths, progress, taskKey, now, { ...taskDetails, localPath });
     return true;
   } catch (error) {
+    if (download) {
+      await download.transfer.body.cancel(error).catch(() => {});
+      await download.flushAccessEvents();
+    }
     await failTask(paths, progress, taskKey, error, now);
     if (error?.stopCollection === true) {
       throw error;
